@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Queue release runs (never cancel a publish mid-flight); a rapid second merge
+# waits rather than racing release-please into a "Reference already exists" fail.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    name: Publish to Hex.pm
+    runs-on: ubuntu-latest
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    steps:
+      # Check out the released tag, not the triggering sha: release-please tags
+      # the release-PR merge commit, which is not necessarily the commit that
+      # triggered this run, so the tarball must come from the tag.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+          elixir-version: "1.20"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      # Gate the publish on the same checks CI runs. `mix hex.publish` compiles
+      # and builds docs, so a hard compile error already aborts -- but failing
+      # tests, compile/doc warnings, and format/credo regressions would publish
+      # cleanly without this (main has no required-status-check protection).
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Test
+        run: mix test
+
+      - name: Docs (warnings as errors)
+        run: mix docs --warnings-as-errors
+
+      - name: Audit deps for retirements
+        run: mix hex.audit
+
+      - name: Publish
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+        run: mix hex.publish --yes
