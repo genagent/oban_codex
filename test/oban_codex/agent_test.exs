@@ -449,6 +449,37 @@ defmodule ObanCodex.AgentTest do
       refute Map.has_key?(args, "sandbox")
     end
 
+    test "approve_action's :args size the elevation to this one approval" do
+      id = start_agent!(approved_args: %{"sandbox" => "danger_full_access"})
+      action_id = block_on_permission!(id)
+
+      assert :processing =
+               Agent.approve_action(id, action_id,
+                 args: %{"sandbox" => "workspace_write", "search" => "live"}
+               )
+
+      assert_receive {:enqueued, %{"sandbox" => "workspace_write", "search" => "live"}, _meta}
+
+      :ok = finish_captured(id, {:ok, result("done")})
+      next_id = block_on_permission!(id)
+      assert :processing = Agent.approve_action(id, next_id)
+      assert_receive {:enqueued, %{"sandbox" => "danger_full_access"} = args, _meta}
+      refute Map.has_key?(args, "search")
+    end
+
+    test "approve_action refuses non-string :args keys and leaves the action pending" do
+      id = start_agent!()
+      action_id = block_on_permission!(id)
+
+      assert {:error, {:invalid_args, [:sandbox]}} =
+               Agent.approve_action(id, action_id, args: %{sandbox: "workspace_write"})
+
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+      refute_receive {:enqueued, _args, _meta}, 50
+
+      assert :processing = Agent.approve_action(id, action_id)
+    end
+
     test "reject_action records the denial and returns to :idle without enqueuing" do
       id = start_agent!()
       action_id = block_on_permission!(id)
