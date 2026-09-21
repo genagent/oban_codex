@@ -179,9 +179,20 @@ defmodule ObanCodex.Agent do
   its prompt, and carries the agent's `:approved_args` (e.g. a
   `sandbox` elevation) merged over the default args -- so approval
   actually unlocks the tools the action needs, on that turn only.
+
+  ## Options
+
+    * `:args` -- a string-keyed map of Codex args merged over `:approved_args`
+      for this continuation only. The caller can size the elevation to the
+      action that was approved. Nothing is remembered; a later approval uses
+      the standing args again unless it supplies another override. Non-string
+      keys are refused with `{:error, {:invalid_args, keys}}` and the action
+      stays pending.
   """
-  @spec approve_action(agent_id(), String.t()) :: :processing | {:error, term()}
-  def approve_action(agent_id, action_id), do: call(agent_id, {:approve_action, action_id})
+  @spec approve_action(agent_id(), String.t(), keyword()) :: :processing | {:error, term()}
+  def approve_action(agent_id, action_id, opts \\ []) do
+    call(agent_id, {:approve_action, action_id, Keyword.get(opts, :args, %{})})
+  end
 
   @doc "Reject the pending action: the denial is recorded and the agent returns to `:idle`."
   @spec reject_action(agent_id(), String.t(), String.t()) :: :rejected | {:error, term()}

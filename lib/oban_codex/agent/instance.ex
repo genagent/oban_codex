@@ -298,9 +298,15 @@ defmodule ObanCodex.Agent.Instance do
     {:keep_state_and_data, [:postpone]}
   end
 
-  defp process_event(:awaiting_permission, {:call, from}, {:approve_action, id}, data) do
-    case data.pending_action do
-      %{id: ^id, description: description} ->
+  # `args` is the caller's override for this one continuation, merged over
+  # the standing :approved_args. A bad map is refused and the gate stays open:
+  # it arrives in a call, and a call must never raise inside the agent.
+  defp process_event(:awaiting_permission, {:call, from}, {:approve_action, id, args}, data) do
+    case {data.pending_action, invalid_keys(args)} do
+      {%{id: ^id}, [_bad | _rest] = keys} ->
+        {:keep_state_and_data, [{:reply, from, {:error, {:invalid_args, keys}}}]}
+
+      {%{id: ^id, description: description}, []} ->
         prompt = "Approved: #{description}. Proceed."
 
         data = %{
@@ -313,7 +319,7 @@ defmodule ObanCodex.Agent.Instance do
           from,
           prompt,
           data,
-          data.config.approved_args,
+          Map.merge(data.config.approved_args, args),
           :awaiting_permission,
           %{data | pending_action: %{id: id, description: description}, in_flight_approval: nil}
         )
@@ -711,6 +717,9 @@ defmodule ObanCodex.Agent.Instance do
 
   # The same silent-drop trap ObanCodex.Worker guards at compile time (#75):
   # atom keys would vanish in the string-keyed merge with each job's args.
+  defp invalid_keys(args) when is_map(args), do: Enum.reject(Map.keys(args), &is_binary/1)
+  defp invalid_keys(other), do: [other]
+
   defp validate_string_keys!(key, args) when is_map(args) do
     case Enum.reject(Map.keys(args), &is_binary/1) do
       [] ->
