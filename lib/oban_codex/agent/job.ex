@@ -3,9 +3,12 @@ defmodule ObanCodex.Agent.Job do
   The default Oban worker for agent turns: runs Codex, then routes the
   outcome back to the owning `ObanCodex.Agent.Instance`.
 
-  The owning agent's id rides in the job's meta (`"agent_id"`), where
-  `ObanCodex.Agent.Instance` puts it at enqueue time. A job without an
-  `"agent_id"` (enqueued by hand) runs normally and reports to no one.
+  The owning agent's id, instance generation, and logical turn id ride in the
+  job's meta, where `ObanCodex.Agent.Instance` puts them at enqueue time. The
+  generation prevents a job from an earlier same-id process from controlling
+  its replacement. The turn id keeps retries attached to one logical turn and
+  fences late or duplicate callbacks. A job without an `"agent_id"` (enqueued
+  by hand) runs normally and reports to no one.
 
   ## Retry-awareness
 
@@ -13,9 +16,9 @@ defmodule ObanCodex.Agent.Job do
   turn, not one event per attempt:
 
     * a success, a `{:cancel, _}` verdict, or an `{:error, _}` on the final
-      attempt is terminal -> `ObanCodex.Agent.job_finished/2`
+      attempt is terminal -> `ObanCodex.Agent.job_finished/3`
     * an `{:error, _}` with attempts remaining, or a `{:snooze, _}`, means
-      Oban will re-run the job -> `ObanCodex.Agent.job_retrying/2`, which
+      Oban will re-run the job -> `ObanCodex.Agent.job_retrying/3`, which
       keeps the machine in `:running` and re-arms its watchdog
 
   This worker itself stays at `max_attempts: 1` -- every retry is a fresh paid
@@ -38,23 +41,31 @@ defmodule ObanCodex.Agent.Job do
   use ObanCodex.Worker, queue: :agents, max_attempts: 1
 
   @impl ObanCodex.Worker
-  def handle_result(result, %Oban.Job{meta: %{"agent_id" => agent_id}}) do
-    ObanCodex.Agent.job_finished(agent_id, {:ok, result})
+  def handle_result(result, %Oban.Job{meta: %{"agent_id" => agent_id} = meta}) do
+    ObanCodex.Agent.job_finished(agent_id, {:ok, result}, meta)
     :ok
   end
 
   def handle_result(_result, _job), do: :ok
 
   @impl ObanCodex.Worker
-  def handle_error(oban_return, payload, %Oban.Job{meta: %{"agent_id" => agent_id}} = job) do
+  def handle_error(
+        oban_return,
+        payload,
+        %Oban.Job{meta: %{"agent_id" => agent_id} = meta} = job
+      ) do
     if terminal?(oban_return, job) do
-      ObanCodex.Agent.job_finished(agent_id, {:error, oban_return, payload})
+      ObanCodex.Agent.job_finished(agent_id, {:error, oban_return, payload}, meta)
     else
-      ObanCodex.Agent.job_retrying(agent_id, %{
-        attempt: job.attempt,
-        max_attempts: job.max_attempts,
-        verdict: oban_return
-      })
+      ObanCodex.Agent.job_retrying(
+        agent_id,
+        %{
+          attempt: job.attempt,
+          max_attempts: job.max_attempts,
+          verdict: oban_return
+        },
+        meta
+      )
     end
 
     oban_return

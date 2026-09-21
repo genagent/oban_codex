@@ -23,16 +23,18 @@ end
     session: :fresh
   )
 
-receive do
-  {:turn, args, %{"origin" => "tick"} = meta} ->
-    IO.inspect(args, label: "scheduled turn")
-    IO.inspect(meta, label: "metadata")
-end
+meta =
+  receive do
+    {:turn, args, %{"origin" => "tick"} = meta} ->
+      IO.inspect(args, label: "scheduled turn")
+      IO.inspect(meta, label: "metadata")
+  end
 
 :ok =
   Agent.job_finished(
     "routine",
-    {:ok, ObanCodex.Testing.result("sweep complete", session_id: "thread-routine")}
+    {:ok, ObanCodex.Testing.result("sweep complete", session_id: "thread-routine")},
+    meta
   )
 
 {:ok, :idle} = Agent.await("routine", :idle)

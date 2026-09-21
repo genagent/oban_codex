@@ -39,7 +39,7 @@ assert_receive = fn ->
   end
 end
 
-assert_receive.()
+first_meta = assert_receive.()
 
 permission =
   ObanCodex.Testing.structured_result(
@@ -47,14 +47,14 @@ permission =
     session_id: "thread-demo"
   )
 
-:ok = Agent.job_finished("demo", {:ok, permission})
+:ok = Agent.job_finished("demo", {:ok, permission}, first_meta)
 
 {:ok, {:awaiting_permission, %{id: action_id} = action}} =
   Agent.await("demo", :awaiting_permission)
 
 IO.inspect(action, label: "permission gate")
 :processing = Agent.approve_action("demo", action_id)
-assert_receive.()
+second_meta = assert_receive.()
 
 :ok =
   Agent.job_finished(
@@ -63,7 +63,8 @@ assert_receive.()
      ObanCodex.Testing.structured_result(
        %{"directive" => "none", "summary" => "updated"},
        session_id: "thread-demo"
-     )}
+     )},
+    second_meta
   )
 
 {:ok, :idle} = Agent.await("demo", :idle)

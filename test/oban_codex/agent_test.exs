@@ -1,8 +1,8 @@
 defmodule ObanCodex.AgentTest do
   # The spec's validation suite plus the lifecycle matrix, driven with an
   # injected :enqueue_fun (no Oban, no DB, no Codex): the enqueue lands in the
-  # test mailbox and the test plays the worker's role by casting
-  # `job_finished/2` back at the machine.
+  # test mailbox and the test plays the worker's role with the exact metadata
+  # captured at enqueue time.
   # Timing-sensitive watchdog tests share the globally named Agent supervisor;
   # keep this module serial to avoid scheduler/load races with the SQLite suites.
   use ExUnit.Case, async: false
@@ -16,7 +16,7 @@ defmodule ObanCodex.AgentTest do
     :ok
   end
 
-  # job_finished/2 and emergency_pause/1 are casts; a call (history) queued
+  # job_finished/3 and emergency_pause/1 are casts; a call (history) queued
   # behind one guarantees it has been processed before the registry is read.
   defp settle(id) do
     {:ok, _} = Agent.history(id)
@@ -25,15 +25,31 @@ defmodule ObanCodex.AgentTest do
 
   defp start_agent!(opts \\ []) do
     id = "agent-" <> Integer.to_string(System.unique_integer([:positive]))
+    start_named_agent!(id, opts)
+    id
+  end
+
+  defp start_named_agent!(id, opts) do
     test_pid = self()
 
     enqueue_fun = fn args, meta ->
+      send(test_pid, {:captured_turn, id, meta})
       send(test_pid, {:enqueued, args, meta})
       {:ok, :queued}
     end
 
     {:ok, _pid} = Agent.start_agent(id, Keyword.merge([enqueue_fun: enqueue_fun], opts))
-    id
+    :ok
+  end
+
+  defp finish_captured(id, payload) do
+    assert_receive {:captured_turn, ^id, meta}
+    Agent.job_finished(id, payload, meta)
+  end
+
+  defp retry_captured(id, retry) do
+    assert_receive {:captured_turn, ^id, meta}
+    Agent.job_retrying(id, retry, meta)
   end
 
   describe "registry status reads" do
@@ -116,7 +132,7 @@ defmodule ObanCodex.AgentTest do
       caller = Task.async(fn -> Agent.submit_prompt(id, "second") end)
       refute_receive {:enqueued, %{"prompt" => "second"}, _meta}, 100
 
-      :ok = Agent.job_finished(id, {:ok, result("done")})
+      :ok = finish_captured(id, {:ok, result("done")})
       assert :processing = Task.await(caller)
       assert_receive {:enqueued, %{"prompt" => "second"}, _meta}
       assert {:ok, :running} = Agent.status(id)
@@ -125,7 +141,7 @@ defmodule ObanCodex.AgentTest do
     test "a plain result returns the agent to :idle" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "turn")
-      :ok = Agent.job_finished(id, {:ok, result("all done")})
+      :ok = finish_captured(id, {:ok, result("all done")})
 
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
       assert {:ok, history} = Agent.history(id)
@@ -147,7 +163,7 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "expensive")
 
       err = error(:policy_stop, reason: %{session_id: "sess-9", cost_usd: 1.5})
-      :ok = Agent.job_finished(id, {:error, {:cancel, :policy_stop}, err})
+      :ok = finish_captured(id, {:error, {:cancel, :policy_stop}, err})
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       :processing = Agent.submit_prompt(id, "pick it back up")
@@ -173,7 +189,7 @@ defmodule ObanCodex.AgentTest do
       assert :ok = Agent.cast_prompt(id, "second")
       refute_receive {:enqueued, %{"prompt" => "second"}, _meta}, 100
 
-      :ok = Agent.job_finished(id, {:ok, result("done")})
+      :ok = finish_captured(id, {:ok, result("done")})
       assert_receive {:enqueued, %{"prompt" => "second"}, _meta}
       assert {:ok, :running} = Agent.status(id)
     end
@@ -186,7 +202,7 @@ defmodule ObanCodex.AgentTest do
       turn =
         structured_result(%{"directive" => "ask_user", "question" => "env?"}, session_id: "s")
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
       {:ok, {:waiting_for_user, "env?"}} = Agent.await(id, :waiting_for_user, 1_000)
 
       assert :ok = Agent.cast_prompt(id, "staging")
@@ -213,7 +229,7 @@ defmodule ObanCodex.AgentTest do
     test "session: :fresh starts a new Codex session for that turn" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "one")
-      :ok = Agent.job_finished(id, {:ok, result(result: "done", session_id: "sess-1")})
+      :ok = finish_captured(id, {:ok, result(result: "done", session_id: "sess-1")})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       :processing = Agent.submit_prompt(id, "two", session: :fresh)
@@ -221,7 +237,7 @@ defmodule ObanCodex.AgentTest do
       refute Map.has_key?(args, "session_id")
 
       # the fresh turn's session becomes the new resume handle
-      :ok = Agent.job_finished(id, {:ok, result(result: "ok", session_id: "sess-2")})
+      :ok = finish_captured(id, {:ok, result(result: "ok", session_id: "sess-2")})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
       :processing = Agent.submit_prompt(id, "three")
       assert_receive {:enqueued, %{"prompt" => "three", "session_id" => "sess-2"}, _meta}
@@ -235,7 +251,7 @@ defmodule ObanCodex.AgentTest do
       turn =
         structured_result(%{"directive" => "ask_user", "question" => "env?"}, session_id: "s")
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
       {:ok, {:waiting_for_user, "env?"}} = Agent.await(id, :waiting_for_user, 1_000)
 
       :ok = Agent.cast_prompt(id, "scheduled beat", origin: :tick)
@@ -246,7 +262,7 @@ defmodule ObanCodex.AgentTest do
       # the operator's answer still owns the question; the beat runs after
       :processing = Agent.submit_prompt(id, "staging")
       assert_receive {:enqueued, %{"prompt" => "staging"}, _meta}
-      :ok = Agent.job_finished(id, {:ok, result("deployed")})
+      :ok = finish_captured(id, {:ok, result("deployed")})
       assert_receive {:enqueued, %{"prompt" => "scheduled beat"}, _meta}
     end
 
@@ -268,11 +284,11 @@ defmodule ObanCodex.AgentTest do
           session_id: "s"
         )
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
       {:ok, {:awaiting_permission, action}} = Agent.await(id, :awaiting_permission, 1_000)
       :processing = Agent.approve_action(id, action.id)
       assert_receive {:enqueued, _args, %{"origin" => "operator"}}
-      :ok = Agent.job_finished(id, {:ok, result(result: "fixed", session_id: "s")})
+      :ok = finish_captured(id, {:ok, result(result: "fixed", session_id: "s")})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       # a scheduled beat flips the arc to tick origin
@@ -285,8 +301,9 @@ defmodule ObanCodex.AgentTest do
     test "a retryable attempt keeps the machine :running and records the retry" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
 
-      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: %{"agent_id" => id}}
+      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: meta}
       verdict = {:error, :timeout}
       assert ^verdict = ObanCodex.Agent.Job.handle_error(verdict, error(:timeout), job)
       settle(id)
@@ -301,8 +318,9 @@ defmodule ObanCodex.AgentTest do
     test "a snooze is never terminal" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
 
-      job = %Oban.Job{attempt: 1, max_attempts: 1, meta: %{"agent_id" => id}}
+      job = %Oban.Job{attempt: 1, max_attempts: 1, meta: meta}
       ObanCodex.Agent.Job.handle_error({:snooze, 30}, result("parked"), job)
       settle(id)
 
@@ -312,8 +330,9 @@ defmodule ObanCodex.AgentTest do
     test "the final attempt's failure is terminal" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
 
-      job = %Oban.Job{attempt: 3, max_attempts: 3, meta: %{"agent_id" => id}}
+      job = %Oban.Job{attempt: 3, max_attempts: 3, meta: meta}
       ObanCodex.Agent.Job.handle_error({:error, :timeout}, error(:timeout), job)
 
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
@@ -324,8 +343,9 @@ defmodule ObanCodex.AgentTest do
     test "a cancel verdict is terminal regardless of attempts remaining" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
 
-      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: %{"agent_id" => id}}
+      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: meta}
       ObanCodex.Agent.Job.handle_error({:cancel, :auth}, error(:auth), job)
 
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
@@ -336,7 +356,7 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "turn")
 
       Process.sleep(200)
-      :ok = Agent.job_retrying(id, %{attempt: 1, max_attempts: 3, verdict: {:error, :timeout}})
+      :ok = retry_captured(id, %{attempt: 1, max_attempts: 3, verdict: {:error, :timeout}})
 
       # past the original 300ms deadline but inside the re-armed one
       Process.sleep(200)
@@ -356,7 +376,7 @@ defmodule ObanCodex.AgentTest do
       assert_receive {:enqueued, first_args, _meta}
       refute Map.has_key?(first_args, "session_id")
 
-      :ok = Agent.job_finished(id, {:ok, result(result: "done", session_id: "sess-42")})
+      :ok = finish_captured(id, {:ok, result(result: "done", session_id: "sess-42")})
       settle(id)
 
       :processing = Agent.submit_prompt(id, "second")
@@ -375,7 +395,7 @@ defmodule ObanCodex.AgentTest do
           session_id: "sess-1"
         )
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
 
       # one atomic read: the state and the question it is gated on
       assert {:ok, {:waiting_for_user, "which environment?"}} =
@@ -398,7 +418,7 @@ defmodule ObanCodex.AgentTest do
           session_id: "sess-2"
         )
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
 
       assert {:ok, {:awaiting_permission, %{id: action_id, description: "rewrite lib/core.ex"}}} =
                Agent.await(id, :awaiting_permission, 1_000)
@@ -423,7 +443,7 @@ defmodule ObanCodex.AgentTest do
       assert {:ok, :running} = Agent.status(id)
 
       # the elevation is per-approval: the next normal turn runs locked down
-      :ok = Agent.job_finished(id, {:ok, result("edited")})
+      :ok = finish_captured(id, {:ok, result("edited")})
       :processing = Agent.submit_prompt(id, "normal turn")
       assert_receive {:enqueued, %{"prompt" => "normal turn"} = args, _meta}
       refute Map.has_key?(args, "sandbox")
@@ -475,7 +495,7 @@ defmodule ObanCodex.AgentTest do
       assert {:error, :paused} = Agent.submit_prompt(id, "more work")
 
       # a turn that was in flight when the pause hit is absorbed, not acted on
-      :ok = Agent.job_finished(id, {:ok, result(result: "late", session_id: "sess-late")})
+      :ok = finish_captured(id, {:ok, result(result: "late", session_id: "sess-late")})
       settle(id)
       assert {:ok, :paused} = Agent.status(id)
 
@@ -506,7 +526,7 @@ defmodule ObanCodex.AgentTest do
 
       task = Task.async(fn -> Agent.await(id, [:idle, :awaiting_permission], 1_000) end)
       turn = structured_result(%{"directive" => "request_permission", "action" => "do it"}, [])
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
 
       assert {:ok, {:awaiting_permission, %{id: _, description: "do it"}}} = Task.await(task)
     end
@@ -522,12 +542,12 @@ defmodule ObanCodex.AgentTest do
       id = start_agent!()
 
       :processing = Agent.submit_prompt(id, "one")
-      :ok = Agent.job_finished(id, {:ok, result(result: "done", session_id: "s")})
+      :ok = finish_captured(id, {:ok, result(result: "done", session_id: "s")})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       :processing = Agent.submit_prompt(id, "two")
       err = error(:policy_stop, reason: %{session_id: "s", cost_usd: 1.0})
-      :ok = Agent.job_finished(id, {:error, {:cancel, :policy_stop}, err})
+      :ok = finish_captured(id, {:error, {:cancel, :policy_stop}, err})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       assert {:ok, %{state: :idle, turns: 2, cost_usd: cost, session_id: "s"}} = Agent.info(id)
@@ -539,7 +559,7 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "turn")
 
       structured = %{"directive" => "none", "summary" => "did the thing"}
-      :ok = Agent.job_finished(id, {:ok, structured_result(structured, [])})
+      :ok = finish_captured(id, {:ok, structured_result(structured, [])})
       {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       assert {:ok, history} = Agent.history(id)
@@ -553,7 +573,7 @@ defmodule ObanCodex.AgentTest do
 
       for n <- 1..3 do
         :processing = Agent.submit_prompt(id, "turn #{n}")
-        :ok = Agent.job_finished(id, {:ok, result("done #{n}")})
+        :ok = finish_captured(id, {:ok, result("done #{n}")})
         {:ok, :idle} = Agent.await(id, :idle, 1_000)
       end
 
@@ -579,7 +599,7 @@ defmodule ObanCodex.AgentTest do
           session_id: "sess-a"
         )
 
-      :ok = Agent.job_finished(id, {:ok, turn})
+      :ok = finish_captured(id, {:ok, turn})
 
       {:ok, {:awaiting_permission, %{id: action_id}}} =
         Agent.await(id, :awaiting_permission, 1_000)
@@ -594,7 +614,7 @@ defmodule ObanCodex.AgentTest do
       first_action_id = approve_gated!(id)
 
       err = error(:policy_stop, reason: %{session_id: "sess-b", cost_usd: 1.5})
-      :ok = Agent.job_finished(id, {:error, {:cancel, :policy_stop}, err})
+      :ok = finish_captured(id, {:error, {:cancel, :policy_stop}, err})
 
       assert {:ok, {:awaiting_permission, %{id: new_id, description: "rewrite lib/core.ex"}}} =
                Agent.await(id, :awaiting_permission, 1_000)
@@ -627,14 +647,14 @@ defmodule ObanCodex.AgentTest do
       id = start_agent!()
       approve_gated!(id)
 
-      :ok = Agent.job_finished(id, {:ok, result("edit done")})
+      :ok = finish_captured(id, {:ok, result("edit done")})
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
     end
 
     test "an unapproved failed turn still falls to :idle" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "plain")
-      :ok = Agent.job_finished(id, {:error, {:cancel, :auth}, error(:auth)})
+      :ok = finish_captured(id, {:error, {:cancel, :auth}, error(:auth)})
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
     end
 
@@ -647,9 +667,257 @@ defmodule ObanCodex.AgentTest do
       :resumed = Agent.resume_agent(id)
 
       # the late failure of the approved turn must NOT resurrect the gate
-      :ok = Agent.job_finished(id, {:error, {:cancel, :timeout}, error(:timeout)})
+      :ok = finish_captured(id, {:error, {:cancel, :timeout}, error(:timeout)})
       settle(id)
       assert {:ok, :idle} = Agent.status(id)
+    end
+  end
+
+  describe "turn ownership" do
+    test "a timed-out turn cannot finish the next turn" do
+      id = start_agent!(job_timeout: 40)
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
+      settle(id)
+
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0, session_id: nil}} = Agent.info(id)
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "B", session_id: "session-b")}, b_meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+      assert {:ok, %{turns: 1, session_id: "session-b"}} = Agent.info(id)
+    end
+
+    test "a previous incarnation cannot finish a replacement with the same id" do
+      id = "replacement-" <> Integer.to_string(System.unique_integer([:positive]))
+      :ok = start_named_agent!(id, [])
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+
+      :ok = Agent.stop_agent(id)
+      assert {:ok, :offline} = Agent.await(id, :offline, 1_000)
+      :ok = start_named_agent!(id, [])
+
+      :processing = Agent.submit_prompt(id, "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+      assert a_meta["agent_generation"] != b_meta["agent_generation"]
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
+      settle(id)
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0, session_id: nil}} = Agent.info(id)
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "B", session_id: "session-b")}, b_meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+    end
+
+    test "pause records one matching completion but ignores its directives" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, meta}
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+
+      payload =
+        {:ok,
+         structured_result(
+           %{"directive" => "request_permission", "action" => "rewrite everything"},
+           session_id: "session-a"
+         )}
+
+      :ok = Agent.job_finished(id, payload, meta)
+      settle(id)
+      assert {:ok, :paused} = Agent.status(id)
+      assert {:ok, %{turns: 1, session_id: "session-a", pending_action: nil}} = Agent.info(id)
+
+      :ok = Agent.job_finished(id, payload, meta)
+      settle(id)
+      assert {:ok, %{turns: 1, session_id: "session-a"}} = Agent.info(id)
+    end
+
+    test "a new turn replaces pause-resume bookkeeping ownership" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      :resumed = Agent.resume_agent(id)
+
+      :processing = Agent.submit_prompt(id, "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
+      settle(id)
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0, session_id: nil}} = Agent.info(id)
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "B", session_id: "session-b")}, b_meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+    end
+
+    test "a failed new enqueue preserves pause-resume bookkeeping ownership" do
+      id = "bookkeeping-fail-" <> Integer.to_string(System.unique_integer([:positive]))
+      test_pid = self()
+
+      enqueue_fun = fn args, meta ->
+        if args["prompt"] == "B" do
+          {:error, :db_down}
+        else
+          send(test_pid, {:captured_turn, id, meta})
+          {:ok, :queued}
+        end
+      end
+
+      {:ok, _pid} = Agent.start_agent(id, enqueue_fun: enqueue_fun)
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      :resumed = Agent.resume_agent(id)
+
+      assert {:error, {:enqueue_failed, :db_down}} = Agent.submit_prompt(id, "B")
+      assert {:ok, :idle} = Agent.status(id)
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
+      settle(id)
+      assert {:ok, %{turns: 1, session_id: "session-a"}} = Agent.info(id)
+    end
+
+    test "duplicate completion and late retry are diagnostic only" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
+      payload = {:ok, result(result: "done", session_id: "session")}
+
+      :ok = Agent.job_finished(id, payload, meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+      :ok = Agent.job_finished(id, payload, meta)
+
+      :ok =
+        Agent.job_retrying(
+          id,
+          %{attempt: 2, max_attempts: 3, verdict: {:error, :timeout}},
+          meta
+        )
+
+      settle(id)
+      assert {:ok, %{turns: 1, session_id: "session"}} = Agent.info(id)
+      assert {:ok, history} = Agent.history(id)
+      assert Enum.count(history, &match?({:callback_rejected, _, _, _}, &1)) == 2
+    end
+
+    test "matching retries advance one watermark across both Oban snooze shapes" do
+      id = start_agent!(job_timeout: 1_000)
+      :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
+
+      retry = fn attempt, snoozed ->
+        Agent.job_retrying(
+          id,
+          %{attempt: attempt, max_attempts: 5, verdict: {:snooze, 10}},
+          Map.put(meta, "snoozed", snoozed)
+        )
+      end
+
+      :ok = retry.(1, 0)
+      :ok = retry.(2, 0)
+      :ok = retry.(2, 0)
+      :ok = retry.(1, 2)
+      :ok = retry.(1, 2)
+      settle(id)
+
+      assert {:ok, history} = Agent.history(id)
+      assert Enum.count(history, &match?({:retrying, _}, &1)) == 3
+      assert Enum.count(history, &match?({:callback_rejected, :retrying, _, _}, &1)) == 2
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+    end
+
+    test "an old completion cannot replace a newer approval or session" do
+      id = start_agent!(job_timeout: 40)
+      :processing = Agent.submit_prompt(id, "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+
+      request =
+        structured_result(
+          %{"directive" => "request_permission", "action" => "deploy"},
+          session_id: "session-b"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, request}, b_meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
+      settle(id)
+
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+      assert {:ok, %{turns: 1, session_id: "session-b"}} = Agent.info(id)
+    end
+
+    test "malformed identities and deprecated callbacks fail closed" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
+
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
+      deprecated_finish = apply(Agent, :job_finished, [id, {:ok, result("old")}])
+      assert {:error, :turn_identity_required} = deprecated_finish
+
+      # credo:disable-for-next-line Credo.Check.Refactor.Apply
+      deprecated_retry = apply(Agent, :job_retrying, [id, %{attempt: 1, max_attempts: 3}])
+      assert {:error, :turn_identity_required} = deprecated_retry
+
+      :ok = Agent.job_finished(id, {:ok, result("malformed")}, Map.put(meta, "agent_turn_id", ""))
+      settle(id)
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0}} = Agent.info(id)
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+    end
+
+    test "a failed approval enqueue preserves the pending gate" do
+      id = "approval-fail-" <> Integer.to_string(System.unique_integer([:positive]))
+      test_pid = self()
+
+      enqueue_fun = fn args, meta ->
+        send(test_pid, {:captured_turn, id, meta})
+
+        if String.starts_with?(args["prompt"], "Approved:") do
+          {:error, :db_down}
+        else
+          {:ok, :queued}
+        end
+      end
+
+      {:ok, _pid} = Agent.start_agent(id, enqueue_fun: enqueue_fun)
+      :processing = Agent.submit_prompt(id, "plan")
+      assert_receive {:captured_turn, ^id, meta}
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"})
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert {:error, {:enqueue_failed, :db_down}} = Agent.approve_action(id, action_id)
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+      assert {:ok, %{pending_action: %{id: ^action_id}}} = Agent.info(id)
     end
   end
 
@@ -685,7 +953,7 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "turn")
       assert_receive {:transition, %{agent_id: ^id, from: :idle, to: :running}}
 
-      :ok = Agent.job_finished(id, {:ok, result("done")})
+      :ok = finish_captured(id, {:ok, result("done")})
       assert_receive {:transition, %{agent_id: ^id, from: :running, to: :idle}}
     end
   end
@@ -693,15 +961,23 @@ defmodule ObanCodex.AgentTest do
   describe "ObanCodex.Agent.Job routing" do
     test "handle_result and handle_error report back to the agent named in job meta" do
       id = start_agent!()
-      job = %Oban.Job{meta: %{"agent_id" => id}}
 
       :processing = Agent.submit_prompt(id, "turn one")
-      assert :ok = ObanCodex.Agent.Job.handle_result(result("done"), job)
+      assert_receive {:captured_turn, ^id, first_meta}
+      assert :ok = ObanCodex.Agent.Job.handle_result(result("done"), %Oban.Job{meta: first_meta})
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       :processing = Agent.submit_prompt(id, "turn two")
+      assert_receive {:captured_turn, ^id, second_meta}
       verdict = {:cancel, :auth}
-      assert ^verdict = ObanCodex.Agent.Job.handle_error(verdict, error(:auth), job)
+
+      assert ^verdict =
+               ObanCodex.Agent.Job.handle_error(
+                 verdict,
+                 error(:auth),
+                 %Oban.Job{meta: second_meta}
+               )
+
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
     end
 
