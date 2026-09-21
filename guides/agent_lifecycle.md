@@ -139,7 +139,14 @@ file to resume.
 `ObanCodex.Agent.Job` distinguishes a retryable attempt from a finished logical
 turn. While Oban will retry, the state stays `running`, records a `:retrying`
 entry, and re-arms the watchdog. A terminal result/error feeds
-`ObanCodex.Agent.job_finished/2`.
+`ObanCodex.Agent.job_finished/3`.
+
+Every job carries an opaque instance generation and logical turn id in its
+metadata. The instance checks both inside the state machine before changing
+state, session, approval, counters, or watchdogs. Late outcomes, duplicate
+callbacks, and callbacks from an earlier same-id process are retained only as
+bounded diagnostics. Custom workers that delegate their result and error
+callbacks to `ObanCodex.Agent.Job` inherit this behavior automatically.
 
 Tune `job_timeout` above one command timeout plus the largest expected backoff.
 
@@ -180,11 +187,12 @@ end
 {:ok, _} = ObanCodex.Agent.start_agent("test-agent", enqueue_fun: enqueue)
 :processing = ObanCodex.Agent.submit_prompt("test-agent", "work")
 
-assert_receive {:enqueued, %{"prompt" => "work"}, %{"agent_id" => "test-agent"}}
+assert_receive {:enqueued, %{"prompt" => "work"}, %{"agent_id" => "test-agent"} = meta}
 
 :ok =
   ObanCodex.Agent.job_finished(
     "test-agent",
-    {:ok, ObanCodex.Testing.result("done", session_id: "thread-1")}
+    {:ok, ObanCodex.Testing.result("done", session_id: "thread-1")},
+    meta
   )
 ```
