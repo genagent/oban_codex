@@ -382,6 +382,185 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "second")
       assert_receive {:enqueued, %{"prompt" => "second", "session_id" => "sess-42"}, _meta}
     end
+
+    test "named arcs retain independent provider sessions" do
+      id = start_agent!()
+
+      :processing = Agent.submit_prompt(id, "operator one", arc_id: "operator")
+
+      assert_receive {:enqueued, %{"prompt" => "operator one"},
+                      %{
+                        "arc_id" => "operator",
+                        "continuation_decision" => "fresh",
+                        "continuation_reason" => "no_session"
+                      }}
+
+      :ok = finish_captured(id, {:ok, result(result: "one", session_id: "operator-session")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "sweep one", arc_id: "sweep")
+
+      assert_receive {:enqueued, %{"prompt" => "sweep one"} = sweep_args, %{"arc_id" => "sweep"}}
+
+      refute Map.has_key?(sweep_args, "session_id")
+      :ok = finish_captured(id, {:ok, result(result: "two", session_id: "sweep-session")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "operator two", arc_id: "operator")
+
+      assert_receive {:enqueued,
+                      %{"prompt" => "operator two", "session_id" => "operator-session"},
+                      %{
+                        "arc_id" => "operator",
+                        "session_id" => "operator-session",
+                        "continuation_decision" => "resume"
+                      }}
+
+      assert {:ok,
+              %{
+                session_arcs: %{
+                  "operator" => "operator-session",
+                  "sweep" => "sweep-session"
+                }
+              }} = Agent.info(id)
+    end
+
+    test "a scheduled fresh turn clears only its selected arc" do
+      id = start_agent!(session_arcs: %{"operator" => "operator-1", "sweep" => "sweep-1"})
+
+      :processing =
+        Agent.submit_prompt(id, "new sweep", arc_id: "sweep", origin: :tick, session: :fresh)
+
+      assert_receive {:enqueued, %{"prompt" => "new sweep"} = args,
+                      %{
+                        "arc_id" => "sweep",
+                        "origin" => "tick",
+                        "continuation_decision" => "fresh",
+                        "continuation_reason" => "requested"
+                      }}
+
+      refute Map.has_key?(args, "session_id")
+      :ok = finish_captured(id, {:ok, result(result: "swept", session_id: "sweep-2")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "continue", arc_id: "operator")
+
+      assert_receive {:enqueued, %{"session_id" => "operator-1"}, %{"arc_id" => "operator"}}
+    end
+
+    test "host-seeded arcs resume after an agent process restart" do
+      id = "seeded-" <> Integer.to_string(System.unique_integer([:positive]))
+      start_named_agent!(id, session_arcs: %{"issue-651" => "seed-session"})
+
+      :processing = Agent.submit_prompt(id, "resume", arc_id: "issue-651")
+
+      assert_receive {:enqueued, %{"session_id" => "seed-session"},
+                      %{"arc_id" => "issue-651", "continuation_decision" => "resume"}}
+
+      :ok = finish_captured(id, {:ok, result(result: "done", session_id: "seed-session")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+      :ok = Agent.stop_agent(id)
+      assert {:ok, :offline} = Agent.await(id, :offline, 1_000)
+
+      start_named_agent!(id, session_arcs: %{"issue-651" => "seed-session"})
+      :processing = Agent.submit_prompt(id, "resume again", arc_id: "issue-651")
+
+      assert_receive {:enqueued, %{"session_id" => "seed-session"}, %{"arc_id" => "issue-651"}}
+    end
+
+    test "fork_arc reports the lower wrapper capability gap without enqueueing" do
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      assert {:error, :fork_unsupported} =
+               Agent.fork_arc(id, "main", "experiment", "try another approach")
+
+      refute_receive {:enqueued, _args, _meta}
+      assert {:ok, :idle} = Agent.status(id)
+    end
+
+    test "a rejected session is typed and a deliberate fresh fallback is recorded" do
+      id = start_agent!(session_arcs: %{"work" => "missing-session"})
+      :processing = Agent.submit_prompt(id, "resume", arc_id: "work")
+      assert_receive {:enqueued, %{"session_id" => "missing-session"}, _meta}
+
+      failure = error(:command_failed, reason: :session_not_found)
+      :ok = finish_captured(id, {:error, {:cancel, :session_not_found}, failure})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok,
+              %{
+                continuation: %{
+                  arc_id: "work",
+                  decision: :resume,
+                  outcome: :session_rejected,
+                  outcome_reason: {:cancel, :session_not_found}
+                }
+              }} = Agent.info(id)
+
+      :processing =
+        Agent.submit_prompt(id, "recover from handoff", arc_id: "work", session: :fresh_fallback)
+
+      assert_receive {:enqueued, %{"prompt" => "recover from handoff"} = args,
+                      %{
+                        "arc_id" => "work",
+                        "continuation_decision" => "fresh_fallback",
+                        "continuation_reason" => "resume_failed"
+                      }}
+
+      refute Map.has_key?(args, "session_id")
+    end
+
+    test "rail stops preserve the selected arc and completion telemetry" do
+      id = start_agent!(session_arcs: %{"specialist" => "old-session"})
+      handler_id = "arc-completion-" <> Integer.to_string(System.unique_integer([:positive]))
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:oban_codex, :agent, :turn_completed],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:turn_completed, event, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      :processing = Agent.submit_prompt(id, "continue", arc_id: "specialist")
+      assert_receive {:enqueued, %{"session_id" => "old-session"}, _meta}
+
+      failure = error(:policy_stop, reason: %{session_id: "rail-session", cost_usd: 1.0})
+      :ok = finish_captured(id, {:error, {:cancel, :policy_stop}, failure})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert_receive {:turn_completed, [:oban_codex, :agent, :turn_completed], %{system_time: _},
+                      %{
+                        arc_id: "specialist",
+                        session_id: "rail-session",
+                        continuation_decision: :resume,
+                        outcome: :failed
+                      }}
+
+      assert {:ok, %{session_arcs: %{"specialist" => "rail-session"}}} = Agent.info(id)
+    end
+
+    test "the arc map is bounded and evicts the least recently used handle" do
+      id =
+        start_agent!(
+          session_arcs: %{"a" => "session-a", "b" => "session-b"},
+          max_session_arcs: 2
+        )
+
+      :processing = Agent.submit_prompt(id, "touch a", arc_id: "a")
+      :ok = finish_captured(id, {:ok, result(result: "a", session_id: "session-a")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      :processing = Agent.submit_prompt(id, "new c", arc_id: "c")
+      :ok = finish_captured(id, {:ok, result(result: "c", session_id: "session-c")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, %{session_arcs: %{"a" => "session-a", "c" => "session-c"}}} = Agent.info(id)
+    end
   end
 
   describe ":waiting_for_user" do
@@ -806,18 +985,27 @@ defmodule ObanCodex.AgentTest do
       end
 
       {:ok, _pid} = Agent.start_agent(id, enqueue_fun: enqueue_fun)
-      :processing = Agent.submit_prompt(id, "A")
+      :processing = Agent.submit_prompt(id, "A", arc_id: "arc-a")
       assert_receive {:captured_turn, ^id, a_meta}
       :ok = Agent.emergency_pause(id)
       assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
       :resumed = Agent.resume_agent(id)
 
-      assert {:error, {:enqueue_failed, :db_down}} = Agent.submit_prompt(id, "B")
+      assert {:error, {:enqueue_failed, :db_down}} =
+               Agent.submit_prompt(id, "B", arc_id: "arc-b")
+
       assert {:ok, :idle} = Agent.status(id)
 
       :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "session-a")}, a_meta)
       settle(id)
-      assert {:ok, %{turns: 1, session_id: "session-a"}} = Agent.info(id)
+
+      assert {:ok,
+              %{
+                turns: 1,
+                session_id: nil,
+                session_arcs: %{"arc-a" => "session-a"},
+                active_arc_id: "arc-b"
+              }} = Agent.info(id)
     end
 
     test "duplicate completion and late retry are diagnostic only" do

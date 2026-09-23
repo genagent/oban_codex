@@ -3,9 +3,9 @@
 The experimental Agent layer keeps conversational state in a `:gen_statem`
 while every model turn remains an ordinary, durable Oban job.
 
-It is intentionally aligned with `oban_claude`. The provider-specific
-difference is the resume handle: Codex's `thread_id` is placed in the next job
-as `"session_id"`.
+It is intentionally aligned with `oban_claude`. Provider sessions live in
+bounded, host-named conversation arcs; the provider-specific resume handle is
+Codex's `thread_id`, placed in the next job as `"session_id"`.
 
 ## Supervision
 
@@ -21,9 +21,10 @@ children = [
 
 The supervisor owns a Registry and DynamicSupervisor. Agents exist only while
 their processes are alive. Oban durably retains queued jobs and retry attempts,
-but it does not restore an Agent's session id, history, pending gate, or current
-turn after that process stops. A replacement with the same id has a new
-generation and rejects late callbacks from the earlier process.
+but it does not restore an Agent's arcs, history, pending gate, or current turn
+after that process stops. Seed persisted arc handles when starting the
+replacement. It has a new generation and rejects late callbacks from the
+earlier process.
 
 ## Start an agent
 
@@ -42,7 +43,9 @@ generation and rejects late callbacks from the earlier process.
       "approval_policy" => "never"
     },
     job_timeout: :timer.minutes(12),
-    max_history: 500
+    max_history: 500,
+    session_arcs: %{"operator" => persisted_thread_id},
+    max_session_arcs: 32
   )
 ```
 
@@ -54,6 +57,8 @@ Configuration:
 - `oban` — named Oban instance, default `Oban`.
 - `job_timeout` — watchdog for one attempt plus expected retry backoff.
 - `max_history` — bounded in-process event history.
+- `session_arcs` — optional `%{arc_id => thread_id}` restore seed.
+- `max_session_arcs` — bounded retained handle count, default 32.
 - `enqueue_fun` — offline test seam.
 
 ## States
@@ -131,12 +136,35 @@ Each completed result supplies:
 ObanCodex.session_id(result)
 ```
 
-The next turn receives that value under `"session_id"`. Use
-`session: :fresh` for a prompt that should start a new conversation:
+The next turn in the same arc receives that value under `"session_id"`.
+Omitting `arc_id` uses the backward-compatible `"default"` arc:
 
 ```elixir
-ObanCodex.Agent.submit_prompt("triage-7", "start over", session: :fresh)
+ObanCodex.Agent.submit_prompt("triage-7", "continue the issue",
+  arc_id: "issue-651"
+)
+
+ObanCodex.Agent.submit_prompt("triage-7", "start a new sweep",
+  arc_id: "daily-sweep",
+  session: :fresh
+)
 ```
+
+Freshness clears only the selected arc. `session: :fresh_fallback` records
+that the host deliberately started fresh after a failed resume. A terminal
+resume classified as `:session_not_found`, `:invalid_session`,
+`:unknown_session`, or `:session_rejected` appears in `info/1` as the typed
+continuation `outcome: :session_rejected`, so the host can reconstruct a
+durable handoff and retry without silently selecting another local transcript.
+
+Each job's metadata and `[:oban_codex, :agent, :turn_completed]` telemetry
+identify the arc, input session, continuation decision and reason, and final
+outcome. Least-recently used inactive handles are evicted at the configured
+bound. Durable persistence and rotation policy belong to the host.
+
+The provider-neutral `fork_arc/5` API currently returns
+`{:error, :fork_unsupported}` because `codex_wrapper` does not expose a stable
+`codex exec fork` command contract yet.
 
 Never put `ephemeral: true` in an Agent's default args; there would be no session
 file to resume.
@@ -169,6 +197,7 @@ machine:
    {"0 9 * * *", ObanCodex.Agent.Tick,
     args: %{
       "agent_id" => "standup",
+      "arc_id" => "daily-sweep",
       "prompt" => "Summarize overnight CI failures.",
       "session" => "fresh",
       "if_offline" => "start",
@@ -201,9 +230,10 @@ unlock the agent or trigger a directive while paused.
 {:ok, history} = ObanCodex.Agent.history("triage-7")
 ```
 
-`info` includes state, session id, turns, pending scopes, and `cost_usd`.
-Codex doesn't report price, so cost stays `0.0` unless a custom error payload
-provides one.
+`info` includes state, the default session id, all retained `session_arcs`,
+the active arc, the current or most recent continuation, turns, pending scopes,
+and `cost_usd`. Codex doesn't report price, so cost stays `0.0` unless a custom
+error payload provides one.
 
 ## Offline tests
 

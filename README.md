@@ -293,7 +293,8 @@ Then start and prompt a long-lived conversational state machine:
 {:ok, status} = ObanCodex.Agent.status("triage-7")
 ```
 
-The state machine threads `session_id` across ordinary Oban jobs and supports
+The state machine retains bounded, host-named conversation arcs and threads
+each arc's `session_id` across ordinary Oban jobs. It supports
 idle, running, waiting-for-user, awaiting-permission, and paused states.
 `cost_usd` remains in its info map for cross-package shape compatibility, but it
 stays `0.0` unless a custom error payload reports cost.

@@ -140,8 +140,11 @@ defmodule ObanCodex.Agent do
 
     * `:session` -- `:resume` (default) continues the agent's Codex session;
       `:fresh` starts a new one for this turn (the resume handle is cleared at
-      delivery time, so it composes with queued prompts). Use `:fresh` to stop
-      a long-lived agent's context from growing without bound.
+      delivery time, so it composes with queued prompts); `:fresh_fallback`
+      records that the host deliberately started fresh after a failed resume.
+    * `:arc_id` -- an opaque non-empty string naming the provider conversation;
+      defaults to `"default"`. Arcs isolate their session handles while the
+      agent remains single-turn-at-a-time.
     * `:origin` -- `:operator` (default) or `:tick`. A `:tick` prompt is a
       scheduled delivery: in `:waiting_for_user` it queues behind the pending
       question instead of being consumed as the answer.
@@ -170,6 +173,22 @@ defmodule ObanCodex.Agent do
     # validate opts eagerly, before the registry lookup can short-circuit
     event = {:user_prompt, prompt, prompt_opts(opts)}
     with_agent(agent_id, &:gen_statem.cast(&1, event))
+  end
+
+  @doc """
+  Fork one named conversation arc into another and run `prompt` on the fork.
+
+  The current `codex_wrapper` command surface does not expose `codex exec
+  fork`, so this returns `{:error, :fork_unsupported}` without enqueueing a
+  turn. The stable API is present now so support can land without changing the
+  host contract.
+  """
+  @spec fork_arc(agent_id(), String.t(), String.t(), String.t(), keyword()) ::
+          :processing | {:error, term()}
+  def fork_arc(_agent_id, source_arc_id, target_arc_id, _prompt, _opts \\ []) do
+    validate_arc_id!(:source_arc_id, source_arc_id)
+    validate_arc_id!(:target_arc_id, target_arc_id)
+    {:error, :fork_unsupported}
   end
 
   @doc """
@@ -211,9 +230,10 @@ defmodule ObanCodex.Agent do
   def resume_agent(agent_id), do: call(agent_id, :resume)
 
   @doc """
-  The agent's bookkeeping in one map: `:state`, `:session_id`, `:turns`,
-  accumulated `:cost_usd`, and any `:pending_action` / `:pending_question`.
-  A call into the process (unlike `status/1`); works in every state.
+  The agent's bookkeeping in one map. `:session_id` remains the legacy default
+  arc handle; `:session_arcs`, `:active_arc_id`, and `:continuation` expose the
+  named-arc state and the current or most recent fresh/resume decision. Also
+  includes `:state`, `:turns`, accumulated `:cost_usd`, and any pending gate.
   """
   @spec info(agent_id()) :: {:ok, map()} | {:error, :agent_not_running}
   def info(agent_id), do: call(agent_id, :info)
@@ -282,16 +302,33 @@ defmodule ObanCodex.Agent do
   defp prompt_opts(opts) do
     session = Keyword.get(opts, :session, :resume)
     origin = Keyword.get(opts, :origin, :operator)
+    arc_id = Keyword.get(opts, :arc_id)
+    fork_from = Keyword.get(opts, :fork_from)
 
-    unless session in [:resume, :fresh] do
-      raise ArgumentError, "unknown :session #{inspect(session)}; expected :resume or :fresh"
+    unless session in [:resume, :fresh, :fresh_fallback] do
+      raise ArgumentError,
+            "unknown :session #{inspect(session)}; expected :resume, :fresh, or :fresh_fallback"
     end
 
     unless origin in [:operator, :tick] do
       raise ArgumentError, "unknown :origin #{inspect(origin)}; expected :operator or :tick"
     end
 
-    %{session: session, origin: origin}
+    validate_arc_id!(:arc_id, arc_id)
+    validate_arc_id!(:fork_from, fork_from)
+
+    %{session: session, origin: origin, arc_id: arc_id, fork_from: fork_from}
+  end
+
+  defp validate_arc_id!(_name, nil), do: :ok
+
+  defp validate_arc_id!(_name, value)
+       when is_binary(value) and byte_size(value) in 1..256,
+       do: :ok
+
+  defp validate_arc_id!(name, value) do
+    raise ArgumentError,
+          ":#{name} must be a non-empty string of at most 256 bytes, got: #{inspect(value)}"
   end
 
   defp poll_await(agent_id, states, deadline) do
