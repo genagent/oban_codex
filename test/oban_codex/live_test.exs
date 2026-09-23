@@ -42,7 +42,7 @@ defmodule ObanCodex.LiveTest do
     assert is_map(ObanCodex.usage(result))
   end
 
-  test "run/2 round-trips structured output from an output schema" do
+  test "run/2 preserves structured output across a resumed session" do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -65,14 +65,31 @@ defmodule ObanCodex.LiveTest do
         sandbox: :read_only,
         approval_policy: :never,
         skip_git_repo_check: true,
-        ephemeral: true,
         output_schema: path,
         timeout: 120_000
       )
 
-    assert {:ok, %Result{success: true} = result} = ObanCodex.run(args)
-    assert ObanCodex.structured(result) == %{"outcome" => "done"}
-    assert ObanCodex.outcome(result) == "done"
+    assert {:ok, %Result{success: true} = initial} = ObanCodex.run(args)
+    assert ObanCodex.structured(initial) == %{"outcome" => "done"}
+    assert ObanCodex.outcome(initial) == "done"
+
+    session_id = ObanCodex.session_id(initial)
+    assert is_binary(session_id)
+
+    resumed =
+      ObanCodex.Args.new(
+        prompt: "Return outcome set to done again.",
+        session_id: session_id,
+        sandbox: :read_only,
+        approval_policy: :never,
+        skip_git_repo_check: true,
+        output_schema: path,
+        timeout: 120_000
+      )
+
+    assert {:ok, %Result{success: true} = continuation} = ObanCodex.run(resumed)
+    assert ObanCodex.structured(continuation) == %{"outcome" => "done"}
+    assert ObanCodex.outcome(continuation) == "done"
   end
 
   test "worker perform/1 reaches handle_result/2 for a real turn" do

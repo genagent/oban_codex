@@ -10,7 +10,7 @@ def deps do
   [
     {:ecto_sqlite3, "~> 0.17"},
     {:oban, "~> 2.23"},
-    {:oban_codex, "~> 0.1"}
+    {:oban_codex, "~> 0.2"}
   ]
 end
 ```

@@ -1,8 +1,9 @@
-# Demonstrate the real timeout classification used by retrying Agent workers.
-# The first turn intentionally has an unrealistically small timeout; the second
-# is the manual equivalent of Oban's later attempt.
+# Demonstrate the timeout classification a retrying worker receives. The first
+# turn intentionally has an unrealistically small timeout; the second is a
+# manual follow-up with a practical timeout. This does not start Oban or an
+# Agent process.
 #
-#     mix run examples/agent_retry_live.exs
+#     mix run examples/timeout_retry_live.exs
 
 base =
   ObanCodex.Args.defaults(

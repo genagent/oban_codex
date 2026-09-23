@@ -20,7 +20,10 @@ children = [
 ```
 
 The supervisor owns a Registry and DynamicSupervisor. Agents exist only while
-their processes are alive; their turns and retry state are durable Oban data.
+their processes are alive. Oban durably retains queued jobs and retry attempts,
+but it does not restore an Agent's session id, history, pending gate, or current
+turn after that process stops. A replacement with the same id has a new
+generation and rejects late callbacks from the earlier process.
 
 ## Start an agent
 
@@ -109,12 +112,16 @@ The lifecycle interprets two conventional structured directives:
 {:ok, {:awaiting_permission, %{id: action_id, description: description}}} =
   ObanCodex.Agent.status("triage-7")
 
-:processing = ObanCodex.Agent.approve_action("triage-7", action_id)
+:processing =
+  ObanCodex.Agent.approve_action("triage-7", action_id,
+    args: %{"sandbox" => "workspace_write"}
+  )
 ```
 
-Only the continuation turn receives `approved_args`. If that turn fails or hits
-the watchdog, the action re-gates with a fresh id rather than silently losing
-its elevation.
+Only the continuation turn receives `approved_args` and the optional
+string-keyed `:args` overrides passed to `approve_action/3`. If that turn fails
+or hits the watchdog, the action re-gates with a fresh id rather than silently
+losing its elevation.
 
 ## Session threading
 
@@ -149,6 +156,32 @@ bounded diagnostics. Custom workers that delegate their result and error
 callbacks to `ObanCodex.Agent.Job` inherit this behavior automatically.
 
 Tune `job_timeout` above one command timeout plus the largest expected backoff.
+
+## Scheduling
+
+`ObanCodex.Agent.Tick` adapts `Oban.Plugins.Cron` to the lifecycle by delivering
+a prompt through the Agent facade. It does not enqueue a turn behind the state
+machine:
+
+```elixir
+{Oban.Plugins.Cron,
+ crontab: [
+   {"0 9 * * *", ObanCodex.Agent.Tick,
+    args: %{
+      "agent_id" => "standup",
+      "prompt" => "Summarize overnight CI failures.",
+      "session" => "fresh",
+      "if_offline" => "start",
+      "start" => %{"args" => %{"sandbox" => "read_only"}}
+    }}
+ ]}
+```
+
+Tick policies are `if_busy` (`"skip"` by default or `"queue"`), `if_offline`
+(`"skip"` by default or `"start"`), and `session` (`"resume"` by default or
+`"fresh"`). Run ticks on a dedicated queue such as
+`queues: [agents: 2, ticks: 1]`; a tick on the Agent turn queue can wait behind
+the work whose busy state it is meant to observe.
 
 ## Emergency pause
 

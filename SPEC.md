@@ -109,7 +109,6 @@ The captured Codex thread id is placed in the next turn's `"session_id"`.
 - Consider a pluggable cost calculator from token usage and model pricing. Do
   not bake mutable pricing into the core package.
 - Add a deployment recipe for external checkout/worktree managers.
-- Exercise initial + resumed structured turns in the opt-in live suite.
 - Keep the parity table checked whenever either Oban integration adds a public
   feature.
 
@@ -120,5 +119,7 @@ The captured Codex thread id is placed in the next turn's `"session_id"`.
 - `mix test`
 - `mix credo --strict`
 - `mix dialyzer`
-- `mix docs`
+- `mix docs --warnings-as-errors`
+- `mix hex.audit`
 - package build against the released `codex_wrapper` dependency (no path dep)
+- clean consumer compile against the unpacked Hex package

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented here.
 
-## [0.1.0](https://github.com/genagent/oban_codex/compare/v0.1.0...v0.1.0) (2026-07-29)
+## [0.1.0](https://github.com/genagent/oban_codex/releases/tag/v0.1.0) (2026-07-29)
 
 
 ### Features
