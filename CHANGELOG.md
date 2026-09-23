@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.0](https://github.com/genagent/oban_codex/compare/v0.2.0...v0.3.0) (2026-09-23)
+
+
+### Features
+
+* add named session arcs ([#13](https://github.com/genagent/oban_codex/issues/13)) ([1098655](https://github.com/genagent/oban_codex/commit/1098655c48948dc676fcfee85b48dfdb09014333))
+
 ## [0.2.0](https://github.com/genagent/oban_codex/compare/v0.1.0...v0.2.0) (2026-09-23)
 
 
