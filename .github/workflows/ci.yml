@@ -56,8 +56,8 @@ jobs:
       # self-terminate in seconds with Codex stubbed. Excluded:
       # scheduled_routine.exs and agent_routine.exs (each waits ~70s for a Cron
       # tick), triage_issues.exs (shells to `gh`), console.exs
-      # (interactive/paid), agent_live.exs, agent_retry_live.exs, and
-      # agent_routine_live.exs (paid) -- all still parsed by
+      # (interactive/paid), agent_live.exs, timeout_retry_live.exs, and
+      # scheduled_turn_live.exs (paid) -- all still parsed by
       # `mix format --check-formatted` above.
       - run: |
           for ex in playground propose_dispose event_driven agent_lifecycle; do

@@ -1,7 +1,8 @@
-# Run one real "routine beat". In production Oban.Plugins.Cron inserts
-# ObanCodex.Agent.Tick with equivalent args.
+# Run one real stateless turn with the args a scheduled routine might use. This
+# demonstrates the model call only; the offline agent_routine.exs example and
+# ObanCodex.Agent.Tick tests exercise lifecycle delivery and policy.
 #
-#     mix run examples/agent_routine_live.exs
+#     mix run examples/scheduled_turn_live.exs
 
 args =
   ObanCodex.Args.new(
