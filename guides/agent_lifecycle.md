@@ -159,8 +159,12 @@ durable handoff and retry without silently selecting another local transcript.
 
 Each job's metadata and `[:oban_codex, :agent, :turn_completed]` telemetry
 identify the arc, input session, continuation decision and reason, and final
-outcome. Least-recently used inactive handles are evicted at the configured
-bound. Durable persistence and rotation policy belong to the host.
+outcome. Pass an opaque `correlation_id` to `submit_prompt/3` or
+`cast_prompt/3` to carry an application request identity through postponed
+delivery, job metadata, turn transitions, approval continuations, and
+completion. Turn events also expose the wrapper-owned `agent_generation` and
+`agent_turn_id`. Least-recently used inactive handles are evicted at the
+configured bound. Durable persistence and rotation policy belong to the host.
 
 The provider-neutral `fork_arc/5` API currently returns
 `{:error, :fork_unsupported}` because `codex_wrapper` does not expose a stable

@@ -106,6 +106,66 @@ defmodule ObanCodex.AgentTest do
       assert_receive {:enqueued, %{"prompt" => "run deep code audit step"}, %{"agent_id" => ^id}}
     end
 
+    test "application correlation joins job metadata and lifecycle telemetry" do
+      handler = "agent-correlation-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach_many(
+          handler,
+          [
+            [:oban_codex, :agent, :transition],
+            [:oban_codex, :agent, :turn_completed]
+          ],
+          fn event, _measurements, meta, _config ->
+            send(test_pid, {:lifecycle, event, meta})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = start_agent!()
+      correlation_id = "request-42"
+
+      assert :processing =
+               Agent.submit_prompt(id, "run", correlation_id: correlation_id, arc_id: "operator")
+
+      assert_receive {:captured_turn, ^id,
+                      %{
+                        "correlation_id" => ^correlation_id,
+                        "agent_generation" => generation,
+                        "agent_turn_id" => turn_id,
+                        "arc_id" => "operator"
+                      } = captured}
+
+      assert_receive {:enqueued, %{"prompt" => "run"}, ^captured}
+
+      assert_receive {:lifecycle, [:oban_codex, :agent, :transition],
+                      %{
+                        from: :idle,
+                        to: :running,
+                        correlation_id: ^correlation_id,
+                        agent_generation: ^generation,
+                        agent_turn_id: ^turn_id,
+                        arc_id: "operator"
+                      }}
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, captured)
+
+      assert_receive {:lifecycle, [:oban_codex, :agent, :turn_completed],
+                      %{
+                        outcome: :completed,
+                        correlation_id: ^correlation_id,
+                        agent_generation: ^generation,
+                        agent_turn_id: ^turn_id,
+                        arc_id: "operator"
+                      }}
+
+      assert_receive {:lifecycle, [:oban_codex, :agent, :transition],
+                      %{from: :running, to: :idle, correlation_id: ^correlation_id}}
+    end
+
     test "config default args ride under the prompt; approved_args do not" do
       id =
         start_agent!(
@@ -124,6 +184,39 @@ defmodule ObanCodex.AgentTest do
 
       assert {:error, {:enqueue_failed, :db_down}} = Agent.submit_prompt(id, "go")
       assert {:ok, :idle} = Agent.status(id)
+    end
+
+    test "an enqueue failure emits the exact correlated terminal outcome" do
+      handler = "agent-correlation-failure-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :turn_completed],
+          fn _event, _measurements, meta, _config -> send(test_pid, {:completed, meta}) end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = "agent-fail-" <> Integer.to_string(System.unique_integer([:positive]))
+      {:ok, _} = Agent.start_agent(id, enqueue_fun: fn _args, _meta -> {:error, :db_down} end)
+
+      assert {:error, {:enqueue_failed, :db_down}} =
+               Agent.submit_prompt(id, "go", correlation_id: "request-failed")
+
+      assert_receive {:completed,
+                      %{
+                        correlation_id: "request-failed",
+                        outcome: :enqueue_failed,
+                        outcome_reason: :db_down,
+                        agent_generation: generation,
+                        agent_turn_id: turn_id
+                      }}
+
+      assert is_binary(generation)
+      assert is_binary(turn_id)
     end
 
     test "unexpected enqueue failures leave the agent alive and idle" do
@@ -157,6 +250,19 @@ defmodule ObanCodex.AgentTest do
       assert :processing = Task.await(caller)
       assert_receive {:enqueued, %{"prompt" => "second"}, _meta}
       assert {:ok, :running} = Agent.status(id)
+    end
+
+    test "a postponed prompt keeps its own correlation id" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "first", correlation_id: "request-first")
+      assert_receive {:enqueued, %{"prompt" => "first"}, %{"correlation_id" => "request-first"}}
+
+      assert :ok = Agent.cast_prompt(id, "second", correlation_id: "request-second")
+      refute_receive {:enqueued, %{"prompt" => "second"}, _meta}, 100
+
+      :ok = finish_captured(id, {:ok, result("done")})
+
+      assert_receive {:enqueued, %{"prompt" => "second"}, %{"correlation_id" => "request-second"}}
     end
 
     test "a plain result returns the agent to :idle" do
@@ -318,6 +424,7 @@ defmodule ObanCodex.AgentTest do
     test "unknown option values raise" do
       assert_raise ArgumentError, fn -> Agent.submit_prompt("x", "p", session: :bogus) end
       assert_raise ArgumentError, fn -> Agent.cast_prompt("x", "p", origin: :cron) end
+      assert_raise ArgumentError, fn -> Agent.cast_prompt("x", "p", correlation_id: "") end
     end
 
     test "job meta carries the arc's origin, and continuations inherit it" do
@@ -675,6 +782,31 @@ defmodule ObanCodex.AgentTest do
       :processing = Agent.submit_prompt(id, "normal turn")
       assert_receive {:enqueued, %{"prompt" => "normal turn"} = args, _meta}
       refute Map.has_key?(args, "sandbox")
+    end
+
+    test "an approval continuation retains the gated turn correlation" do
+      id = start_agent!()
+
+      :processing =
+        Agent.submit_prompt(id, "plan", correlation_id: "request-gated")
+
+      assert_receive {:enqueued, %{"prompt" => "plan"}, %{"correlation_id" => "request-gated"}}
+
+      turn =
+        structured_result(
+          %{"directive" => "request_permission", "action" => "edit the file"},
+          session_id: "sess-gated"
+        )
+
+      :ok = finish_captured(id, {:ok, turn})
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert :processing = Agent.approve_action(id, action_id)
+
+      assert_receive {:enqueued, %{"session_id" => "sess-gated"},
+                      %{"correlation_id" => "request-gated"}}
     end
 
     test "approve_action's :args size the elevation to this one approval" do
