@@ -624,16 +624,6 @@ defmodule ObanCodex.AgentTest do
       assert_receive {:enqueued, %{"session_id" => "seed-session"}, %{"arc_id" => "issue-651"}}
     end
 
-    test "fork_arc reports the lower wrapper capability gap without enqueueing" do
-      id = start_agent!(session_arcs: %{"main" => "parent-session"})
-
-      assert {:error, :fork_unsupported} =
-               Agent.fork_arc(id, "main", "experiment", "try another approach")
-
-      refute_receive {:enqueued, _args, _meta}
-      assert {:ok, :idle} = Agent.status(id)
-    end
-
     test "a rejected session is typed and a deliberate fresh fallback is recorded" do
       id = start_agent!(session_arcs: %{"work" => "missing-session"})
       :processing = Agent.submit_prompt(id, "resume", arc_id: "work")
@@ -716,6 +706,199 @@ defmodule ObanCodex.AgentTest do
       assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
 
       assert {:ok, %{session_arcs: %{"a" => "session-a", "c" => "session-c"}}} = Agent.info(id)
+    end
+  end
+
+  describe "fork_arc/5" do
+    defp attach_completion! do
+      handler_id = "fork-completion-" <> Integer.to_string(System.unique_integer([:positive]))
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:oban_codex, :agent, :turn_completed],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:turn_completed, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
+    test "enqueues a fork job from the source handle with fork metadata" do
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      assert :processing = Agent.fork_arc(id, "main", "experiment", "try another approach")
+
+      assert_receive {:enqueued,
+                      %{
+                        "prompt" => "try another approach",
+                        "session_id" => "parent-session",
+                        "fork_session" => true
+                      },
+                      %{
+                        "arc_id" => "experiment",
+                        "continuation_decision" => "fork",
+                        "continuation_reason" => "fork",
+                        "fork_from_arc_id" => "main",
+                        "source_session_id" => "parent-session"
+                      } = meta}
+
+      refute Map.has_key?(meta, "replaced_session_id")
+
+      assert {:ok,
+              %{
+                active_arc_id: "experiment",
+                continuation: %{decision: :fork, fork_from_arc_id: "main", outcome: :running}
+              }} = Agent.info(id)
+    end
+
+    test "completion stores the new thread on the target and leaves the source alone" do
+      attach_completion!()
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch", correlation_id: "corr-1")
+      :ok = finish_captured(id, {:ok, result(result: "forked", session_id: "forked-session")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok,
+              %{session_arcs: %{"main" => "parent-session", "experiment" => "forked-session"}}} =
+               Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: "forked-session",
+                        continuation_decision: :fork,
+                        outcome: :completed,
+                        fork_from_arc_id: "main",
+                        source_session_id: "parent-session",
+                        correlation_id: "corr-1"
+                      } = metadata}
+
+      refute Map.has_key?(metadata, :replaced_session_id)
+
+      # the next turn on the fork resumes its own thread and is not a fork
+      :processing = Agent.submit_prompt(id, "keep going", arc_id: "experiment")
+
+      assert_receive {:enqueued, %{"session_id" => "forked-session"} = args,
+                      %{"continuation_decision" => "resume"} = meta}
+
+      refute Map.has_key?(args, "fork_session")
+      refute Map.has_key?(meta, "fork_from_arc_id")
+    end
+
+    test "an occupied target is replaced and its previous handle is reported" do
+      attach_completion!()
+
+      id =
+        start_agent!(session_arcs: %{"main" => "parent-session", "experiment" => "old-session"})
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "start over from main")
+
+      assert_receive {:enqueued, %{"session_id" => "parent-session", "fork_session" => true},
+                      %{
+                        "arc_id" => "experiment",
+                        "source_session_id" => "parent-session",
+                        "replaced_session_id" => "old-session"
+                      }}
+
+      :ok = finish_captured(id, {:ok, result(result: "forked", session_id: "forked-session")})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok,
+              %{session_arcs: %{"main" => "parent-session", "experiment" => "forked-session"}}} =
+               Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: "forked-session",
+                        replaced_session_id: "old-session",
+                        source_session_id: "parent-session"
+                      }}
+    end
+
+    test "a failed fork leaves the target arc unchanged" do
+      attach_completion!()
+
+      id =
+        start_agent!(session_arcs: %{"main" => "parent-session", "experiment" => "old-session"})
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch")
+      assert_receive {:enqueued, %{"fork_session" => true}, _meta}
+
+      failure = error(:policy_stop, reason: %{session_id: "half-forked", cost_usd: 1.0})
+      :ok = finish_captured(id, {:error, {:cancel, :policy_stop}, failure})
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, %{session_arcs: %{"main" => "parent-session", "experiment" => "old-session"}}} =
+               Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: "old-session",
+                        continuation_decision: :fork,
+                        outcome: :failed
+                      }}
+    end
+
+    test "a result that echoes the source handle is never written onto the target" do
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch")
+
+      :ok =
+        finish_captured(id, {:ok, result(result: "no new thread", session_id: "parent-session")})
+
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, %{session_arcs: arcs}} = Agent.info(id)
+      assert arcs == %{"main" => "parent-session"}
+    end
+
+    test "a missing source handle enqueues nothing" do
+      id = start_agent!(session_arcs: %{"other" => "other-session"})
+
+      assert {:error, {:enqueue_failed, {:fork_source_missing, "main"}}} =
+               Agent.fork_arc(id, "main", "experiment", "branch")
+
+      refute_receive {:enqueued, _args, _meta}
+      assert {:ok, :idle} = Agent.status(id)
+
+      assert {:ok,
+              %{
+                session_arcs: %{"other" => "other-session"},
+                continuation: %{decision: :fork, outcome: :enqueue_failed}
+              }} = Agent.info(id)
+    end
+
+    test "forking an arc into itself is refused without enqueueing" do
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      assert {:error, :same_arc} = Agent.fork_arc(id, "main", "main", "branch")
+      refute_receive {:enqueued, _args, _meta}
+      assert {:ok, :idle} = Agent.status(id)
+
+      # the same guard holds when fork_from is passed to the prompt path directly
+      assert {:error, {:enqueue_failed, :same_arc}} =
+               Agent.submit_prompt(id, "branch", arc_id: "main", fork_from: "main")
+
+      refute_receive {:enqueued, _args, _meta}
+    end
+
+    test "arc ids are validated" do
+      id = start_agent!(session_arcs: %{"main" => "parent-session"})
+
+      assert_raise ArgumentError, ~r/:source_arc_id/, fn ->
+        Agent.fork_arc(id, "", "experiment", "branch")
+      end
+
+      assert_raise ArgumentError, ~r/:target_arc_id/, fn ->
+        Agent.fork_arc(id, "main", nil, "branch")
+      end
     end
   end
 
