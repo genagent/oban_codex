@@ -73,6 +73,38 @@ and inserts `--output-schema` before the positional thread id and prompt.
 Remove the shim after the minimum wrapper version exposes this option, with a
 regression test proving identical arguments.
 
+## Forks
+
+Command layer:
+
+- A fork is a run with `session_id: <source thread id>` plus
+  `fork_session: true`. `ObanCodex.Query` routes it to `codex exec fork`
+  through `CodexWrapper.ExecFork` (`codex_wrapper 0.5.0`).
+- The new thread id arrives on the result (`thread.started`), so
+  `ObanCodex.session_id/1` returns the fork's id. The source thread is
+  unchanged.
+- `fork_session: true` without a session id raises.
+- `exec fork` rejects `profile`, `add_dir`, `color`, `oss` and
+  `local_provider`. Setting any of them with `fork_session: true` raises in
+  `Args.new/1`.
+- A CLI without `exec fork` yields the typed, non-retryable reason
+  `{:unsupported, :exec_fork}`.
+
+Agent:
+
+- `Agent.fork_arc(agent_id, source_arc_id, target_arc_id, prompt, opts)` forks
+  the source arc's session into the target arc and runs the prompt on the
+  fork.
+- A target arc that already has a session is replaced. The replaced session id
+  is reported in completion telemetry.
+- The source arc handle is never rewritten. A failed fork leaves the target
+  unchanged.
+- `source == target` returns `{:error, :same_arc}`.
+- A source arc with no session handle returns
+  `{:error, {:enqueue_failed, {:fork_source_missing, source_arc_id}}}`.
+- Job meta carries `continuation_decision: "fork"`, `fork_from_arc_id` and
+  `source_session_id`.
+
 ## Intentional divergence from oban_claude
 
 - Codex policy is `sandbox` + `approval_policy`, not `permission_mode`.

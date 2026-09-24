@@ -166,9 +166,15 @@ completion. Turn events also expose the wrapper-owned `agent_generation` and
 `agent_turn_id`. Least-recently used inactive handles are evicted at the
 configured bound. Durable persistence and rotation policy belong to the host.
 
-The provider-neutral `fork_arc/5` API currently returns
-`{:error, :fork_unsupported}` because `codex_wrapper` does not expose a stable
-`codex exec fork` command contract yet.
+`fork_arc/5` forks the source arc's Codex thread into the target arc through
+`codex exec fork` and runs the prompt on the fork. If the target arc already
+has a session, that session is replaced and the replaced session id is reported
+in completion telemetry. The source arc handle is never rewritten, and a failed
+fork leaves the target arc unchanged. Forking an arc into itself returns
+`{:error, :same_arc}`. A source arc with no session handle returns
+`{:error, {:enqueue_failed, {:fork_source_missing, source_arc_id}}}`. A CLI
+without `exec fork` fails the turn with the non-retryable reason
+`{:unsupported, :exec_fork}`.
 
 Never put `ephemeral: true` in an Agent's default args; there would be no session
 file to resume.

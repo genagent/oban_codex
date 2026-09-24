@@ -86,6 +86,7 @@ Provider semantics intentionally differ:
 | permissions | `permission_mode`, tool allow/deny | `sandbox`, `approval_policy`, explicit dangerous bypass flags |
 | structured output | inline JSON Schema | path to a JSON Schema file |
 | resume | Claude resume flags | Codex thread id through `session_id`; `resume` is an alias |
+| fork | Claude fork flags | `codex exec fork` through `session_id` plus `fork_session: true`; new thread id on the result |
 | isolation | CLI worktree option | provide a dedicated checkout/working directory outside this package |
 | config sealing | Claude hermetic scopes | `ignore_user_config`, `ignore_rules`, `strict_config`, explicit overrides |
 | spend/turn rails | wrapper reports cost and rail stops | Codex JSONL reports token usage, not price or turn-budget errors |
@@ -297,7 +298,9 @@ The state machine retains bounded, host-named conversation arcs and threads
 each arc's `session_id` across ordinary Oban jobs. It supports
 idle, running, waiting-for-user, awaiting-permission, and paused states.
 `cost_usd` remains in its info map for cross-package shape compatibility, but it
-stays `0.0` unless a custom error payload reports cost.
+stays `0.0` unless a custom error payload reports cost. `fork_arc/5` forks one
+arc's Codex thread into another arc and runs a prompt on the fork, leaving the
+source arc untouched.
 
 See [Agent lifecycle](guides/agent_lifecycle.md).
 

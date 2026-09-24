@@ -92,6 +92,50 @@ defmodule ObanCodex.LiveTest do
     assert ObanCodex.outcome(continuation) == "done"
   end
 
+  test "run/2 forks a real session and resumes the fork" do
+    source =
+      ObanCodex.Args.new(
+        prompt: "Reply with exactly the word OK and nothing else.",
+        sandbox: :read_only,
+        approval_policy: :never,
+        skip_git_repo_check: true,
+        timeout: 120_000
+      )
+
+    assert {:ok, %Result{success: true} = initial} = ObanCodex.run(source)
+    source_id = ObanCodex.session_id(initial)
+    assert is_binary(source_id)
+
+    fork =
+      ObanCodex.Args.new(
+        prompt: "Reply with exactly the word OK and nothing else.",
+        session_id: source_id,
+        fork_session: true,
+        sandbox: :read_only,
+        approval_policy: :never,
+        skip_git_repo_check: true,
+        timeout: 120_000
+      )
+
+    assert {:ok, %Result{success: true} = forked} = ObanCodex.run(fork)
+    fork_id = ObanCodex.session_id(forked)
+    assert is_binary(fork_id)
+    assert fork_id != source_id
+
+    resumed =
+      ObanCodex.Args.new(
+        prompt: "Reply with exactly the word OK and nothing else.",
+        session_id: fork_id,
+        sandbox: :read_only,
+        approval_policy: :never,
+        skip_git_repo_check: true,
+        timeout: 120_000
+      )
+
+    assert {:ok, %Result{success: true} = continuation} = ObanCodex.run(resumed)
+    assert ObanCodex.session_id(continuation) == fork_id
+  end
+
   test "worker perform/1 reaches handle_result/2 for a real turn" do
     job = %Oban.Job{args: %{"prompt" => "Reply with exactly the word OK."}}
     assert {:cancel, {:handled, true}} = EchoWorker.perform(job)
