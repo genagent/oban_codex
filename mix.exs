@@ -60,7 +60,7 @@ defmodule ObanCodex.MixProject do
       {:oban, "~> 2.23"},
       # The thin seam onto `codex exec`. Keep this on a deliberate 0.x minor:
       # ObanCodex mirrors the Exec and ExecResume option vocabularies.
-      {:codex_wrapper, "~> 0.4.0"},
+      {:codex_wrapper, "~> 0.5.0"},
       # Schema for `ObanCodex.Args`: validates the builder's options and
       # generates their documentation from a single source of truth.
       {:nimble_options, "~> 1.1"},
