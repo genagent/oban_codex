@@ -845,6 +845,205 @@ defmodule ObanCodex.AgentTest do
                       }}
     end
 
+    test "a fork that exhausts its retries on a timeout leaves both arcs unchanged" do
+      attach_completion!()
+      arcs = %{"main" => "parent-session"}
+      id = start_agent!(session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch")
+      assert_receive {:captured_turn, ^id, meta}
+
+      failure = error(:timeout, reason: %{session_id: "half-forked"})
+      job = %Oban.Job{attempt: 3, max_attempts: 3, meta: meta}
+      ObanCodex.Agent.Job.handle_error({:error, :timeout}, failure, job)
+
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+      assert {:ok, history} = Agent.history(id)
+      assert {:job_error, {:error, :timeout}} in history
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: nil,
+                        continuation_decision: :fork,
+                        outcome: :failed,
+                        outcome_reason: {:error, :timeout},
+                        fork_from_arc_id: "main",
+                        source_session_id: "parent-session"
+                      } = metadata}
+
+      refute Map.has_key?(metadata, :replaced_session_id)
+    end
+
+    test "a retryable timeout keeps the fork in flight until its thread arrives" do
+      attach_completion!()
+      arcs = %{"main" => "parent-session", "experiment" => "old-session"}
+      id = start_agent!(session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch")
+      assert_receive {:captured_turn, ^id, meta}
+
+      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: meta}
+      ObanCodex.Agent.Job.handle_error({:error, :timeout}, error(:timeout), job)
+      settle(id)
+
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+      refute_receive {:turn_completed, _metadata}, 50
+
+      payload = {:ok, result(result: "forked", session_id: "forked-session")}
+      :ok = Agent.job_finished(id, payload, meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok,
+              %{session_arcs: %{"main" => "parent-session", "experiment" => "forked-session"}}} =
+               Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: "forked-session",
+                        continuation_decision: :fork,
+                        outcome: :completed
+                      }}
+    end
+
+    test "a fork that hits the watchdog leaves both arcs unchanged" do
+      attach_completion!()
+      arcs = %{"main" => "parent-session", "experiment" => "old-session"}
+      id = start_agent!(job_timeout: 50, session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "hang")
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, history} = Agent.history(id)
+      assert :watchdog_timeout in history
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: nil,
+                        continuation_decision: :fork,
+                        outcome: :timed_out,
+                        outcome_reason: :watchdog_timeout,
+                        fork_from_arc_id: "main",
+                        source_session_id: "parent-session",
+                        replaced_session_id: "old-session"
+                      }}
+    end
+
+    test "a fork completion after its turn timed out never reaches the target arc" do
+      attach_completion!()
+      arcs = %{"main" => "parent-session"}
+      id = start_agent!(job_timeout: 200, session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+      assert_receive {:turn_completed, %{outcome: :timed_out}}
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "forked-a")}, a_meta)
+      settle(id)
+
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0, session_arcs: ^arcs}} = Agent.info(id)
+      assert {:ok, history} = Agent.history(id)
+      assert Enum.any?(history, &match?({:callback_rejected, :finished, :stale_turn, _}, &1))
+      refute_receive {:turn_completed, _metadata}, 20
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "B", session_id: "forked-b")}, b_meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, %{session_arcs: %{"main" => "parent-session", "experiment" => "forked-b"}}} =
+               Agent.info(id)
+    end
+
+    test "a fork completion from a replaced incarnation never reaches the target arc" do
+      attach_completion!()
+      id = "fork-replacement-" <> Integer.to_string(System.unique_integer([:positive]))
+      arcs = %{"main" => "parent-session"}
+
+      :ok = start_named_agent!(id, session_arcs: arcs)
+      :processing = Agent.fork_arc(id, "main", "experiment", "A")
+      assert_receive {:captured_turn, ^id, a_meta}
+
+      # stopping the agent is the only way to abandon an in-flight fork job
+      :ok = Agent.stop_agent(id)
+      assert {:ok, :offline} = Agent.await(id, :offline, 1_000)
+      :ok = start_named_agent!(id, session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "B")
+      assert_receive {:captured_turn, ^id, b_meta}
+      assert a_meta["agent_generation"] != b_meta["agent_generation"]
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "A", session_id: "forked-a")}, a_meta)
+      settle(id)
+
+      assert {:ok, :running} = Agent.status(id)
+      assert {:ok, %{turns: 0, session_arcs: ^arcs}} = Agent.info(id)
+      assert {:ok, history} = Agent.history(id)
+
+      assert Enum.any?(
+               history,
+               &match?({:callback_rejected, :finished, :foreign_generation, _}, &1)
+             )
+
+      refute_receive {:turn_completed, _metadata}, 50
+
+      :ok = Agent.job_finished(id, {:ok, result(result: "B", session_id: "forked-b")}, b_meta)
+      assert {:ok, :idle} = Agent.await(id, :idle, 1_000)
+
+      assert {:ok, %{session_arcs: %{"main" => "parent-session", "experiment" => "forked-b"}}} =
+               Agent.info(id)
+    end
+
+    test "pausing an in-flight fork leaves both arcs as they were" do
+      attach_completion!()
+      arcs = %{"main" => "parent-session", "experiment" => "old-session"}
+      id = start_agent!(session_arcs: arcs)
+
+      :processing = Agent.fork_arc(id, "main", "experiment", "branch")
+      assert_receive {:captured_turn, ^id, meta}
+
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+      refute_receive {:turn_completed, _metadata}, 50
+
+      # the interrupted job reports a cancellation: recorded, nothing adopted
+      failure = error(:interrupted, reason: %{session_id: "half-forked"})
+      job = %Oban.Job{attempt: 1, max_attempts: 3, meta: meta}
+      ObanCodex.Agent.Job.handle_error({:cancel, :interrupted}, failure, job)
+      settle(id)
+
+      assert {:ok, :paused} = Agent.status(id)
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+
+      assert_receive {:turn_completed,
+                      %{
+                        arc_id: "experiment",
+                        session_id: "old-session",
+                        continuation_decision: :fork,
+                        outcome: :failed
+                      }}
+
+      :resumed = Agent.resume_agent(id)
+      assert {:ok, %{session_arcs: ^arcs}} = Agent.info(id)
+
+      # the target still resumes its own thread, and the next turn is no fork
+      :processing = Agent.submit_prompt(id, "carry on", arc_id: "experiment")
+
+      assert_receive {:enqueued, %{"session_id" => "old-session"} = args,
+                      %{"continuation_decision" => "resume"}}
+
+      refute Map.has_key?(args, "fork_session")
+    end
+
     test "a result that echoes the source handle is never written onto the target" do
       id = start_agent!(session_arcs: %{"main" => "parent-session"})
 
