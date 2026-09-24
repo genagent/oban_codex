@@ -58,6 +58,7 @@ defmodule ObanCodexTest do
         "model" => "gpt-5",
         "sandbox" => "read_only",
         "approval_policy" => "on_request",
+        "skip_git_repo_check" => true,
         "search" => "live",
         "color" => "never",
         "add_dir" => ["/a", "/b"],
@@ -70,6 +71,7 @@ defmodule ObanCodexTest do
       assert opts[:model] == "gpt-5"
       assert opts[:sandbox] == :read_only
       assert opts[:approval_policy] == :on_request
+      assert opts[:skip_git_repo_check] == true
       assert opts[:search] == :live
       assert opts[:color] == :never
       assert opts[:add_dir] == ["/a", "/b"]
