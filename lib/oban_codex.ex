@@ -66,7 +66,8 @@ defmodule ObanCodex do
 
   @passthrough ~w(model profile sandbox approval_policy full_auto
                   dangerously_bypass_approvals_and_sandbox
-                  dangerously_bypass_hook_trust working_dir timeout verbose binary
+                  dangerously_bypass_hook_trust skip_git_repo_check
+                  working_dir timeout verbose binary
                   add_dir search ephemeral output_schema output_last_message images
                   config_overrides enabled_features disabled_features strict_config
                   ignore_user_config ignore_rules color oss local_provider session_id)
