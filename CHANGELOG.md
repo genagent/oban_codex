@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.0](https://github.com/genagent/oban_codex/compare/v0.4.0...v0.5.0) (2026-09-24)
+
+
+### Features
+
+* fork Codex conversation arcs ([#26](https://github.com/genagent/oban_codex/issues/26)) ([88d3c37](https://github.com/genagent/oban_codex/commit/88d3c37cbf089c69073005b60c7b626606fcd2cb)), closes [#25](https://github.com/genagent/oban_codex/issues/25)
+
 ## [0.4.0](https://github.com/genagent/oban_codex/compare/v0.3.2...v0.4.0) (2026-09-24)
 
 
