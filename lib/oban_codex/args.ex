@@ -119,6 +119,15 @@ defmodule ObanCodex.Args do
         "Alias for `:session_id`, retained to keep lifecycle code and migration " <>
           "patterns aligned with `oban_claude`. Do not set both."
     ],
+    fork_session: [
+      type: :boolean,
+      doc:
+        "Fork the thread named by `:session_id`/`:resume` into a new Codex thread " <>
+          "(`codex exec fork`) instead of resuming it. The source thread is left " <>
+          "unchanged and the new thread id is on the result. `codex exec fork` " <>
+          "rejects `:profile`, `:add_dir`, `:color`, `:oss` and `:local_provider`, " <>
+          "so setting any of them with `fork_session: true` raises."
+    ],
     meta: [
       type: {:map, {:or, [:atom, :string]}, :any},
       doc:
@@ -126,6 +135,8 @@ defmodule ObanCodex.Args do
           "It is not forwarded to Codex."
     ]
   ]
+
+  @fork_rejected [:profile, :add_dir, :color, :oss, :local_provider]
 
   @options_schema NimbleOptions.new!(@schema)
   @codex_option_keys @schema |> Keyword.delete(:meta) |> Keyword.keys() |> Enum.map(&to_string/1)
@@ -209,6 +220,8 @@ defmodule ObanCodex.Args do
       raise ArgumentError, ":ephemeral sessions cannot be resumed"
     end
 
+    validate_fork!(opts)
+
     overlap =
       opts
       |> Keyword.get(:enabled_features, [])
@@ -222,6 +235,24 @@ defmodule ObanCodex.Args do
     end
 
     opts
+  end
+
+  defp validate_fork!(opts) do
+    if opts[:fork_session] do
+      unless opts[:session_id] || opts[:resume] do
+        raise ArgumentError, ":fork_session requires :session_id or :resume"
+      end
+
+      rejected = for key <- @fork_rejected, opts[key] not in [nil, false], do: key
+
+      if rejected != [] do
+        raise ArgumentError,
+              "codex exec fork does not accept #{inspect(rejected)}; " <>
+                "remove them from a :fork_session job"
+      end
+    end
+
+    :ok
   end
 
   defp to_map(opts) do

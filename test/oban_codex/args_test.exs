@@ -56,7 +56,7 @@ defmodule ObanCodex.ArgsTest do
 
     expected =
       Args.keys()
-      |> Enum.reject(&(&1 in [:meta, :session_id, :resume]))
+      |> Enum.reject(&(&1 in [:meta, :session_id, :resume, :fork_session]))
       |> Enum.map(&Atom.to_string/1)
       |> MapSet.new()
 
@@ -106,6 +106,59 @@ defmodule ObanCodex.ArgsTest do
 
     assert_raise ArgumentError, ~r/cannot be resumed/, fn ->
       Args.new(prompt: "x", session_id: "a", ephemeral: true)
+    end
+  end
+
+  test "fork_session requires a source session" do
+    assert Args.new(prompt: "x", session_id: "a", fork_session: true) == %{
+             "prompt" => "x",
+             "session_id" => "a",
+             "fork_session" => true
+           }
+
+    assert Args.new(prompt: "x", resume: "a", fork_session: true)["fork_session"]
+
+    assert_raise ArgumentError, ~r/requires :session_id or :resume/, fn ->
+      Args.new(prompt: "x", fork_session: true)
+    end
+
+    assert_raise ArgumentError, ~r/cannot be resumed/, fn ->
+      Args.new(prompt: "x", session_id: "a", fork_session: true, ephemeral: true)
+    end
+  end
+
+  test "fork_session rejects options codex exec fork does not accept" do
+    for {key, value} <- [
+          profile: "p",
+          add_dir: "/a",
+          color: :auto,
+          oss: true,
+          local_provider: "ollama"
+        ] do
+      assert_raise ArgumentError, ~r/exec fork does not accept \[#{inspect(key)}\]/, fn ->
+        Args.new([{key, value}, prompt: "x", session_id: "a", fork_session: true])
+      end
+    end
+
+    assert Args.new(prompt: "x", session_id: "a", fork_session: true, oss: false)
+  end
+
+  test "fork_session reaches the query seam and requires a session at run time" do
+    parent = self()
+
+    query = fn _prompt, opts ->
+      send(parent, {:query_opts, opts})
+      {:ok, ObanCodex.Testing.result("done")}
+    end
+
+    args = Args.new(prompt: "x", resume: "thread-1", fork_session: true)
+    assert {:ok, _} = ObanCodex.run(args, query_fun: query)
+    assert_received {:query_opts, opts}
+    assert opts[:session_id] == "thread-1"
+    assert opts[:fork_session] == true
+
+    assert_raise ArgumentError, ~r/fork_session requires/, fn ->
+      ObanCodex.run(%{"prompt" => "x", "fork_session" => true}, query_fun: query)
     end
   end
 

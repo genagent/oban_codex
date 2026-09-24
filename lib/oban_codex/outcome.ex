@@ -9,6 +9,7 @@ defmodule ObanCodex.Outcome do
   | any other non-zero `%Result{}` | `{:error, {:command_failed, code}}` | bounded retry; Codex has no stable typed CLI-error envelope |
   | `%Error{kind: :timeout}` | `{:error, :timeout}` | transient and bounded by `max_attempts` |
   | `%Error{kind: :spawn}` | `{:cancel, :spawn}` | deterministic process setup failure |
+  | `%Error{kind: :unsupported}` | `{:cancel, :unsupported}` | the installed CLI lacks the capability (for example `exec fork`); retrying cannot add it |
   | other normalized `%Error{}` | `{:error, kind}` | retry under Oban's normal attempt bound |
   | an unnormalized error term | `{:cancel, term}` | off-contract and unsafe to retry blindly |
 
@@ -30,6 +31,7 @@ defmodule ObanCodex.Outcome do
     :command_unavailable,
     :invalid_args,
     :invalid_config,
+    :unsupported,
     :version_mismatch
   ]
 

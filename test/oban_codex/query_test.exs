@@ -167,4 +167,91 @@ defmodule ObanCodex.QueryTest do
     assert {:ok, %CodexWrapper.Result{success: false, exit_code: 4, stdout: "bad config"}} =
              Query.run("x", binary: "codex-test")
   end
+
+  describe "forked turns" do
+    test "run codex exec fork with the source id and return the new thread" do
+      assert {:ok, result} =
+               Query.run("branch",
+                 binary: "codex-test",
+                 working_dir: "/repo",
+                 session_id: "thread-9",
+                 fork_session: true,
+                 model: "gpt-5",
+                 sandbox: :read_only,
+                 approval_policy: :never,
+                 search: :disabled,
+                 output_schema: "/repo/schema.json",
+                 profile: "initial-only",
+                 add_dir: "/initial-only",
+                 color: :auto,
+                 oss: true,
+                 local_provider: "ollama",
+                 skip_git_repo_check: true
+               )
+
+      assert ObanCodex.session_id(result) == "thread-1"
+
+      assert_received {:runner, "codex-test", args, opts, nil}
+      assert Keyword.get(opts, :cd) == "/repo"
+      assert Enum.take(args, 2) == ["exec", "fork"]
+      assert "--json" in args
+      assert "--skip-git-repo-check" in args
+      assert Enum.take(args, -3) == ["--", "thread-9", "branch"]
+      assert ~s(sandbox_mode="read-only") in args
+      assert ~s(approval_policy="never") in args
+      assert ~s(web_search="disabled") in args
+
+      assert Enum.drop_while(args, &(&1 != "--output-schema")) |> Enum.take(2) ==
+               ["--output-schema", "/repo/schema.json"]
+
+      for flag <- ~w(--sandbox --profile --full-auto --add-dir --color --oss --local-provider) do
+        refute flag in args
+      end
+    end
+
+    test "keep a non-zero exit a result" do
+      Application.put_env(
+        :oban_codex,
+        :query_test_result,
+        {:exit, 1, "no rollout found for thread id thread-9"}
+      )
+
+      assert {:ok, %CodexWrapper.Result{success: false, exit_code: 1}} =
+               Query.run("x", binary: "codex-test", session_id: "thread-9", fork_session: true)
+    end
+
+    test "type a CLI without exec fork as unsupported" do
+      Application.put_env(
+        :oban_codex,
+        :query_test_result,
+        {:exit, 2, "error: unexpected argument 'thread-9' found"}
+      )
+
+      assert {:error, %ObanCodex.Error{kind: :unsupported, reason: {:unsupported, :exec_fork}}} =
+               Query.run("x", binary: "codex-test", session_id: "thread-9", fork_session: true)
+
+      assert {{:cancel, :unsupported}, %ObanCodex.Error{}} =
+               ObanCodex.Outcome.classify(
+                 {:error, ObanCodex.Error.from_reason({:unsupported, :exec_fork})}
+               )
+    end
+
+    test "normalize a fork timeout" do
+      Application.put_env(:oban_codex, :query_test_result, {:error, :timeout})
+
+      assert {:error, %ObanCodex.Error{kind: :timeout}} =
+               Query.run("x",
+                 binary: "codex-test",
+                 timeout: 5_000,
+                 session_id: "thread-9",
+                 fork_session: true
+               )
+    end
+
+    test "require a source session" do
+      assert_raise ArgumentError, ~r/requires :session_id/, fn ->
+        Query.run("x", binary: "codex-test", fork_session: true)
+      end
+    end
+  end
 end
