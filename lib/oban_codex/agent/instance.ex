@@ -921,9 +921,15 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp complete_watchdog(data) do
+    arc_id = data.current_turn.continuation.arc_id
+
     continuation =
       data.current_turn.continuation
-      |> Map.merge(%{outcome: :timed_out, outcome_reason: :watchdog_timeout})
+      |> Map.merge(%{
+        outcome: :timed_out,
+        outcome_reason: :watchdog_timeout,
+        result_session_id: SessionArcs.session(data.arcs, arc_id)
+      })
 
     emit_completion(data, continuation)
     %{data | last_continuation: continuation}
@@ -984,10 +990,11 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   # A fork's input handle is the source arc's, so it never stands in for the
-  # target's session: only the target's own handle (the new thread on success,
-  # the unchanged one on failure, nil when it has none) is reported.
+  # target's session: only the target's own handle is reported. That is the new
+  # thread on success, the target's unchanged handle on failure, and nil only
+  # when the target had none.
   defp completion_session_id(%{decision: :fork} = continuation),
-    do: continuation.result_session_id
+    do: continuation.result_session_id || continuation.replaced_session_id
 
   defp completion_session_id(continuation),
     do: continuation.result_session_id || continuation.session_id

@@ -92,7 +92,7 @@ defmodule ObanCodex.LiveTest do
     assert ObanCodex.outcome(continuation) == "done"
   end
 
-  test "run/2 forks a real session and resumes the fork" do
+  test "run/2 forks a real session and resumes both the fork and the source" do
     source =
       ObanCodex.Args.new(
         prompt: "Reply with exactly the word OK and nothing else.",
@@ -134,6 +134,20 @@ defmodule ObanCodex.LiveTest do
 
     assert {:ok, %Result{success: true} = continuation} = ObanCodex.run(resumed)
     assert ObanCodex.session_id(continuation) == fork_id
+
+    source_resumed =
+      ObanCodex.Args.new(
+        prompt: "Reply with exactly the word OK and nothing else.",
+        session_id: source_id,
+        sandbox: :read_only,
+        approval_policy: :never,
+        skip_git_repo_check: true,
+        timeout: 120_000
+      )
+
+    assert {:ok, %Result{success: true} = source_again} = ObanCodex.run(source_resumed)
+    assert ObanCodex.session_id(source_again) == source_id
+    assert source_id != fork_id
   end
 
   test "worker perform/1 reaches handle_result/2 for a real turn" do

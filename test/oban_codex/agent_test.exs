@@ -924,7 +924,7 @@ defmodule ObanCodex.AgentTest do
       assert_receive {:turn_completed,
                       %{
                         arc_id: "experiment",
-                        session_id: nil,
+                        session_id: "old-session",
                         continuation_decision: :fork,
                         outcome: :timed_out,
                         outcome_reason: :watchdog_timeout,
