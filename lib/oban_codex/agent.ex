@@ -181,17 +181,38 @@ defmodule ObanCodex.Agent do
   @doc """
   Fork one named conversation arc into another and run `prompt` on the fork.
 
-  The current `codex_wrapper` command surface does not expose `codex exec
-  fork`, so this returns `{:error, :fork_unsupported}` without enqueueing a
-  turn. The stable API is present now so support can land without changing the
-  host contract.
+  The turn runs `codex exec fork` from the source arc's session handle, so the
+  source conversation is left untouched. When the turn completes, the new
+  thread id from its result becomes the target arc's handle. A target arc that
+  already has a handle is replaced; its previous id is reported as
+  `:replaced_session_id` in the job metadata and the completion telemetry. The
+  source arc's handle is never rewritten, and a failed fork leaves the target
+  arc as it was.
+
+  Like `submit_prompt/3` this replies `:processing` once the turn's Oban job is
+  enqueued, and blocks while the agent is busy. Nothing is enqueued and an
+  error is returned when the arcs are the same (`{:error, :same_arc}`) or the
+  source arc has no session handle yet
+  (`{:error, {:enqueue_failed, {:fork_source_missing, source_arc_id}}}`).
+
+  Options: `:origin` and `:correlation_id`, as for `submit_prompt/3`.
   """
   @spec fork_arc(agent_id(), String.t(), String.t(), String.t(), keyword()) ::
           :processing | {:error, term()}
-  def fork_arc(_agent_id, source_arc_id, target_arc_id, _prompt, _opts \\ []) do
-    validate_arc_id!(:source_arc_id, source_arc_id)
-    validate_arc_id!(:target_arc_id, target_arc_id)
-    {:error, :fork_unsupported}
+  def fork_arc(agent_id, source_arc_id, target_arc_id, prompt, opts \\ []) do
+    require_arc_id!(:source_arc_id, source_arc_id)
+    require_arc_id!(:target_arc_id, target_arc_id)
+
+    if source_arc_id == target_arc_id do
+      {:error, :same_arc}
+    else
+      fork_opts =
+        opts
+        |> Keyword.take([:origin, :correlation_id])
+        |> Keyword.merge(arc_id: target_arc_id, fork_from: source_arc_id)
+
+      submit_prompt(agent_id, prompt, fork_opts)
+    end
   end
 
   @doc """
@@ -330,6 +351,12 @@ defmodule ObanCodex.Agent do
       correlation_id: correlation_id
     }
   end
+
+  defp require_arc_id!(name, nil) do
+    raise ArgumentError, ":#{name} must be a non-empty string of at most 256 bytes, got: nil"
+  end
+
+  defp require_arc_id!(name, value), do: validate_arc_id!(name, value)
 
   defp validate_arc_id!(_name, nil), do: :ok
 

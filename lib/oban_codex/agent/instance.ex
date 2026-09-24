@@ -538,23 +538,29 @@ defmodule ObanCodex.Agent.Instance do
     data
     |> record({:result, ObanCodex.structured(result) || ObanCodex.text(result)})
     |> count_turn(ObanCodex.cost_usd(result))
-    |> keep_session(ObanCodex.session_id(result), data.current_turn.continuation.arc_id)
+    |> keep_session(ObanCodex.session_id(result), data.current_turn.continuation, :ok)
   end
 
   defp absorb(data, {:error, verdict, payload}) do
     data
     |> record({:job_error, verdict})
     |> count_turn(ObanCodex.cost_usd(payload))
-    |> keep_session(ObanCodex.session_id(payload), data.current_turn.continuation.arc_id)
+    |> keep_session(ObanCodex.session_id(payload), data.current_turn.continuation, :error)
   end
 
   defp count_turn(data, cost) do
     %{data | turns: data.turns + 1, cost_usd: data.cost_usd + (cost || 0.0)}
   end
 
-  defp keep_session(data, nil, _arc_id), do: data
+  defp keep_session(data, nil, _continuation, _status), do: data
 
-  defp keep_session(data, session_id, arc_id) do
+  # A fork adopts only the new thread its own successful turn created. A failed
+  # fork leaves the target arc as it was, and the source handle is never
+  # written onto the target, even if the result echoes it.
+  defp keep_session(data, _session_id, %{decision: :fork}, :error), do: data
+  defp keep_session(data, session_id, %{decision: :fork, session_id: session_id}, :ok), do: data
+
+  defp keep_session(data, session_id, %{arc_id: arc_id}, _status) do
     %{data | arcs: SessionArcs.put(data.arcs, arc_id, session_id)}
   end
 
@@ -616,6 +622,8 @@ defmodule ObanCodex.Agent.Instance do
     |> maybe_put_meta("correlation_id", continuation.correlation_id)
     |> maybe_put_meta("session_id", continuation.session_id)
     |> maybe_put_meta("fork_from_arc_id", continuation.fork_from_arc_id)
+    |> maybe_put_meta("source_session_id", continuation.source_session_id)
+    |> maybe_put_meta("replaced_session_id", continuation.replaced_session_id)
   end
 
   defp reject_replacement(changeset) do
@@ -780,7 +788,7 @@ defmodule ObanCodex.Agent.Instance do
 
     case data.fork_from_arc_id do
       fork_from when is_binary(fork_from) ->
-        {:error, {:fork_unsupported, fork_from}}
+        fork_args(data, args, arc_id, fork_from)
 
       nil ->
         session_id = SessionArcs.session(data.arcs, arc_id)
@@ -804,6 +812,30 @@ defmodule ObanCodex.Agent.Instance do
     end
   end
 
+  # The fork runs on the source arc's handle (`codex exec fork`); its result
+  # carries the new thread, which replaces the target arc's handle on success.
+  # The target's previous handle is not cleared here, so a failed fork leaves
+  # it in place.
+  defp fork_args(_data, _args, arc_id, arc_id), do: {:error, :same_arc}
+
+  defp fork_args(data, args, arc_id, fork_from) do
+    case SessionArcs.session(data.arcs, fork_from) do
+      nil ->
+        {:error, {:fork_source_missing, fork_from}}
+
+      source_session ->
+        continuation =
+          continuation(data, :fork, :fork, source_session,
+            fork_from_arc_id: fork_from,
+            source_session_id: source_session,
+            replaced_session_id: SessionArcs.session(data.arcs, arc_id)
+          )
+
+        {:ok, continuation,
+         args |> Map.put("session_id", source_session) |> Map.put("fork_session", true)}
+    end
+  end
+
   defp effective_continuation_request(request, session_id)
        when request in [:fresh, :fresh_fallback] and is_binary(session_id),
        do: :resume
@@ -818,6 +850,8 @@ defmodule ObanCodex.Agent.Instance do
       session_id: session_id,
       result_session_id: nil,
       fork_from_arc_id: Keyword.get(opts, :fork_from_arc_id),
+      source_session_id: Keyword.get(opts, :source_session_id),
+      replaced_session_id: Keyword.get(opts, :replaced_session_id),
       origin: data.origin,
       correlation_id: data.correlation_id,
       outcome: :running,
@@ -826,18 +860,33 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp continuation_failure(data, reason, outcome, turn_id) do
-    session_id = SessionArcs.session(data.arcs, data.active_arc_id)
+    target_session = SessionArcs.session(data.arcs, data.active_arc_id)
+    {session_id, opts} = failure_session(data, target_session)
 
     data
     |> continuation(
       failure_decision(data, session_id),
       failure_reason(data, session_id),
       session_id,
-      fork_from_arc_id: data.fork_from_arc_id
+      opts
     )
     |> then(&identify_continuation(data, &1, turn_id))
     |> Map.merge(%{outcome: outcome, outcome_reason: reason})
   end
+
+  defp failure_session(%{fork_from_arc_id: fork_from} = data, target_session)
+       when is_binary(fork_from) do
+    source_session = SessionArcs.session(data.arcs, fork_from)
+
+    {source_session,
+     [
+       fork_from_arc_id: fork_from,
+       source_session_id: source_session,
+       replaced_session_id: target_session
+     ]}
+  end
+
+  defp failure_session(_data, target_session), do: {target_session, []}
 
   defp identify_continuation(data, continuation, turn_id) do
     Map.merge(continuation, %{
@@ -847,7 +896,7 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp failure_decision(%{fork_from_arc_id: fork_from}, _session_id) when is_binary(fork_from),
-    do: :resume
+    do: :fork
 
   defp failure_decision(%{continuation_request: :fresh_fallback}, _session_id),
     do: :fresh_fallback
@@ -872,9 +921,15 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp complete_watchdog(data) do
+    arc_id = data.current_turn.continuation.arc_id
+
     continuation =
       data.current_turn.continuation
-      |> Map.merge(%{outcome: :timed_out, outcome_reason: :watchdog_timeout})
+      |> Map.merge(%{
+        outcome: :timed_out,
+        outcome_reason: :watchdog_timeout,
+        result_session_id: SessionArcs.session(data.arcs, arc_id)
+      })
 
     emit_completion(data, continuation)
     %{data | last_continuation: continuation}
@@ -922,14 +977,27 @@ defmodule ObanCodex.Agent.Instance do
         agent_turn_id: continuation.agent_turn_id,
         arc_id: continuation.arc_id,
         correlation_id: continuation.correlation_id,
-        session_id: continuation.result_session_id || continuation.session_id,
+        session_id: completion_session_id(continuation),
         continuation_decision: continuation.decision,
         continuation_reason: continuation.reason,
         outcome: continuation.outcome,
         outcome_reason: continuation.outcome_reason
       }
+      |> maybe_put_meta(:fork_from_arc_id, continuation.fork_from_arc_id)
+      |> maybe_put_meta(:source_session_id, continuation.source_session_id)
+      |> maybe_put_meta(:replaced_session_id, continuation.replaced_session_id)
     )
   end
+
+  # A fork's input handle is the source arc's, so it never stands in for the
+  # target's session: only the target's own handle is reported. That is the new
+  # thread on success, the target's unchanged handle on failure, and nil only
+  # when the target had none.
+  defp completion_session_id(%{decision: :fork} = continuation),
+    do: continuation.result_session_id || continuation.replaced_session_id
+
+  defp completion_session_id(continuation),
+    do: continuation.result_session_id || continuation.session_id
 
   defp current_or_last_continuation(%{current_turn: %{continuation: continuation}}),
     do: continuation

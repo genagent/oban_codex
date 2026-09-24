@@ -70,7 +70,8 @@ defmodule ObanCodex do
                   working_dir timeout verbose binary
                   add_dir search ephemeral output_schema output_last_message images
                   config_overrides enabled_features disabled_features strict_config
-                  ignore_user_config ignore_rules color oss local_provider session_id)
+                  ignore_user_config ignore_rules color oss local_provider session_id
+                  fork_session)
 
   @passthrough_atoms Map.new(@passthrough, &{&1, String.to_atom(&1)})
 
@@ -214,14 +215,7 @@ defmodule ObanCodex do
   defp build(args) do
     prompt = Map.fetch!(args, "prompt")
 
-    if Map.has_key?(args, "resume") and Map.has_key?(args, "session_id") do
-      raise ArgumentError,
-            "set only one of resume or session_id; both identify the session to resume"
-    end
-
-    if (args["resume"] || args["session_id"]) && args["ephemeral"] do
-      raise ArgumentError, "ephemeral sessions cannot be resumed"
-    end
+    validate_session_args!(args)
 
     args =
       case args["resume"] do
@@ -235,6 +229,25 @@ defmodule ObanCodex do
       end
 
     {prompt, query_opts}
+  end
+
+  defp validate_session_args!(args) do
+    if Map.has_key?(args, "resume") and Map.has_key?(args, "session_id") do
+      raise ArgumentError,
+            "set only one of resume or session_id; both identify the session to resume"
+    end
+
+    resuming? = args["resume"] || args["session_id"]
+
+    if resuming? && args["ephemeral"] do
+      raise ArgumentError, "ephemeral sessions cannot be resumed"
+    end
+
+    if args["fork_session"] && !resuming? do
+      raise ArgumentError, "fork_session requires resume or session_id"
+    end
+
+    :ok
   end
 
   defp coerce(key, value) when is_binary(value) and is_map_key(@enum_values, key) do

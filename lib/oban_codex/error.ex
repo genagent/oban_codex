@@ -12,7 +12,16 @@ defmodule ObanCodex.Error do
   classified separately as `:command_failed`.
   """
 
-  @type kind :: :timeout | :spawn | :signal | :io | :execution | atom()
+  @type kind ::
+          :timeout
+          | :spawn
+          | :signal
+          | :io
+          | :unsupported
+          | :invalid_args
+          | :missing_session_id
+          | :execution
+          | atom()
 
   @type t :: %__MODULE__{
           kind: kind(),
@@ -42,6 +51,24 @@ defmodule ObanCodex.Error do
     new(:timeout,
       reason: reason,
       message: "Codex execution timed out after #{inspect(milliseconds)}ms"
+    )
+  end
+
+  def from_reason({:unsupported, capability} = reason) do
+    new(:unsupported,
+      reason: reason,
+      message: "the installed Codex CLI does not support #{inspect(capability)}"
+    )
+  end
+
+  def from_reason({:invalid_session_id, value} = reason) do
+    new(:invalid_args, reason: reason, message: "invalid Codex session id #{inspect(value)}")
+  end
+
+  def from_reason({:missing_session_id, _result} = reason) do
+    new(:missing_session_id,
+      reason: reason,
+      message: "Codex exited successfully without reporting a new thread id"
     )
   end
 

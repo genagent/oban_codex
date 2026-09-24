@@ -59,9 +59,11 @@ defmodule Mix.Tasks.ObanCodex.InstallTest do
   end
 
   # Igniter.Test exposes created/updated file bodies via the rewrite sources;
-  # read one out of the applied igniter for content assertions.
+  # read one out of the formatted igniter for content assertions. This avoids
+  # apply_igniter!/1, whose glob re-include drops every source when the checkout
+  # path contains a hidden directory (for example a .claude/worktrees checkout).
   defp source_content(igniter, path) do
-    igniter = Igniter.Test.apply_igniter!(igniter)
+    %{issues: []} = igniter = Igniter.prepare_for_write(igniter)
     Rewrite.source!(igniter.rewrite, path) |> Rewrite.Source.get(:content)
   end
 end
