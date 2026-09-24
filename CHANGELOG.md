@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.4.0](https://github.com/genagent/oban_codex/compare/v0.3.2...v0.4.0) (2026-09-24)
+
+
+### Features
+
+* preserve application correlation through agent turns (closes [#22](https://github.com/genagent/oban_codex/issues/22)) ([#23](https://github.com/genagent/oban_codex/issues/23)) ([787380c](https://github.com/genagent/oban_codex/commit/787380c54ad30dc594ae545a4d07cd149ba6327f))
+
 ## [0.3.2](https://github.com/genagent/oban_codex/compare/v0.3.1...v0.3.2) (2026-09-24)
 
 
