@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.3.2](https://github.com/genagent/oban_codex/compare/v0.3.1...v0.3.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* forward skip_git_repo_check through run/2 ([#20](https://github.com/genagent/oban_codex/issues/20)) ([9d9e767](https://github.com/genagent/oban_codex/commit/9d9e767d679981eb23597e36cf8f5f05b8de9d6b))
+
 ## [0.3.1](https://github.com/genagent/oban_codex/compare/v0.3.0...v0.3.1) (2026-09-24)
 
 
