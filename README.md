@@ -2,6 +2,9 @@
 
 [![Hex.pm](https://img.shields.io/hexpm/v/oban_codex.svg)](https://hex.pm/packages/oban_codex)
 [![Documentation](https://img.shields.io/badge/hex-docs-purple.svg)](https://hexdocs.pm/oban_codex)
+[![CI](https://github.com/genagent/oban_codex/actions/workflows/ci.yml/badge.svg)](https://github.com/genagent/oban_codex/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/hexpm/dt/oban_codex.svg)](https://hex.pm/packages/oban_codex)
+[![License](https://img.shields.io/hexpm/l/oban_codex.svg)](https://github.com/genagent/oban_codex/blob/main/LICENSE)
 
 Run [OpenAI Codex](https://developers.openai.com/codex/) turns as durable
 [Oban](https://hexdocs.pm/oban) jobs.
@@ -14,20 +17,22 @@ an Igniter installer, and an opt-in long-lived Agent lifecycle.
 
 ## Install
 
+<!-- x-release-please-start-version -->
 ```elixir
 def deps do
   [
     {:oban, "~> 2.23"},
-    {:oban_codex, "~> 0.2"}
+    {:oban_codex, "~> 0.5.0"}
   ]
 end
 ```
+<!-- x-release-please-end -->
 
 Requirements:
 
 - Elixir `~> 1.20`
 - a configured Oban instance
-- `codex_wrapper ~> 0.4`
+- `codex_wrapper ~> 0.5`
 - the `codex` CLI installed and authenticated for real runs
 
 Check a worker node before enabling its queue:
