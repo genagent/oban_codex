@@ -1917,6 +1917,28 @@ defmodule ObanCodex.AgentTest do
       refute_receive {:enqueued, %{"prompt" => "next config only"}, _meta}, 50
     end
 
+    test "the first latch keeps its cause and reason across both APIs" do
+      pause_first = start_agent!()
+      :processing = Agent.submit_prompt(pause_first, "current")
+      assert_receive {:captured_turn, ^pause_first, pause_meta}
+
+      assert :ok = Agent.pause_after_turn(pause_first, :budget_rail, pause_meta)
+      assert :armed = Agent.quiesce(pause_first, :config_handoff)
+
+      assert {:ok, %{deferred_pause: %{cause: :pause_after_turn, reason: :budget_rail}}} =
+               Agent.info(pause_first)
+
+      quiesce_first = start_agent!()
+      :processing = Agent.submit_prompt(quiesce_first, "current")
+      assert_receive {:captured_turn, ^quiesce_first, quiesce_meta}
+
+      assert :armed = Agent.quiesce(quiesce_first, :config_handoff)
+      assert :ok = Agent.pause_after_turn(quiesce_first, :budget_rail, quiesce_meta)
+
+      assert {:ok, %{deferred_pause: %{cause: :quiesce, reason: :config_handoff}}} =
+               Agent.info(quiesce_first)
+    end
+
     test "retains a question gate for one continuation before pausing" do
       id = start_agent!()
       :processing = Agent.submit_prompt(id, "plan")
