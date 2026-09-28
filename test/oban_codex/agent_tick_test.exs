@@ -222,6 +222,7 @@ defmodule ObanCodex.Agent.TickTest do
       "if_offline" => "start",
       "start" => %{
         "args" => %{"model" => "gpt-5"},
+        "config_revision" => "cfg-tick-7",
         "job_timeout" => 90_000,
         "session_arcs" => %{"restored" => "seed-session"}
       }
@@ -246,7 +247,13 @@ defmodule ObanCodex.Agent.TickTest do
              "session_id" => "seed-session"
            } = Jason.decode!(row.args)
 
-    assert %{"agent_id" => ^id, "arc_id" => "restored"} = Jason.decode!(row.meta)
+    assert %{
+             "agent_id" => ^id,
+             "arc_id" => "restored",
+             "config_revision" => "cfg-tick-7"
+           } = Jason.decode!(row.meta)
+
+    assert {:ok, %{config_revision: "cfg-tick-7"}} = Agent.info(id)
   end
 
   test "session fresh delivers the beat without a resume handle" do

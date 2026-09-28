@@ -287,7 +287,8 @@ Then start and prompt a long-lived conversational state machine:
     approved_args: %{
       "sandbox" => "workspace_write",
       "approval_policy" => "never"
-    }
+    },
+    config_revision: "routine-config-42"
   )
 
 :processing = ObanCodex.Agent.submit_prompt("triage-7", "triage new issues")
@@ -303,7 +304,8 @@ arc's Codex thread into another arc and runs a prompt on the fork, leaving the
 source arc untouched.
 
 Host policy can pause safely without hiding a directive returned by the same
-turn. Pass the live job metadata to the synchronous correlated call:
+turn. Pass the job metadata to the synchronous correlated call while the turn
+is running or after it has completed into a question or permission gate:
 
 ```elixir
 :ok =
@@ -319,6 +321,13 @@ in `paused`. A question or permission request stays gated. Its answer or
 approval receives one continuation, and the latch applies when that work
 reaches a terminal boundary. `resume_agent/1` clears the latch;
 `emergency_pause/1` remains the immediate scope-dropping brake.
+
+For an atomic host-managed configuration handoff, call
+`quiesce(agent_id, reason)`. It pauses an idle Agent immediately, arms the live
+turn or parked gate otherwise, and reports `:already_paused` without changing
+an existing pause. The optional `config_revision` start setting is copied into
+`info/1`, every Agent job's metadata, and lifecycle telemetry so the host can
+attribute work to the effective configuration that produced it.
 
 See [Agent lifecycle](guides/agent_lifecycle.md).
 

@@ -45,7 +45,8 @@ callbacks from the earlier process.
     job_timeout: :timer.minutes(12),
     max_history: 500,
     session_arcs: %{"operator" => persisted_thread_id},
-    max_session_arcs: 32
+    max_session_arcs: 32,
+    config_revision: "routine-config-42"
   )
 ```
 
@@ -59,6 +60,9 @@ Configuration:
 - `max_history` — bounded in-process event history.
 - `session_arcs` — optional `%{arc_id => thread_id}` restore seed.
 - `max_session_arcs` — bounded retained handle count, default 32.
+- `config_revision` — optional opaque host revision, exposed in `info/1`, job
+  metadata, and lifecycle telemetry. It must be a non-empty string of at most
+  256 bytes.
 - `enqueue_fun` — offline test seam.
 
 ## States
@@ -158,8 +162,9 @@ continuation `outcome: :session_rejected`, so the host can reconstruct a
 durable handoff and retry without silently selecting another local transcript.
 
 Each job's metadata and `[:oban_codex, :agent, :turn_completed]` telemetry
-identify the arc, input session, continuation decision and reason, and final
-outcome. Pass an opaque `correlation_id` to `submit_prompt/3` or
+identify the arc, input session, continuation decision and reason, final
+outcome, and optional host `config_revision`. Pass an opaque `correlation_id`
+to `submit_prompt/3` or
 `cast_prompt/3` to carry an application request identity through postponed
 delivery, job metadata, turn transitions, approval continuations, and
 completion. Turn events also expose the wrapper-owned `agent_generation` and
@@ -243,9 +248,10 @@ latch without interrupting that result:
 
 The call is synchronous. It validates the job metadata's agent, instance
 generation, and logical turn inside the state machine, then replies only after
-the latch is stored. A matching completion cannot overtake the latch. Repeating
-the request for its source turn or latest continuation is idempotent; the first
-reason wins.
+the latch is stored. The matching turn may still be running or may have just
+completed into `waiting_for_user` or `awaiting_permission`. A matching
+completion cannot overtake the latch. Repeating the request for its source turn
+or latest continuation is idempotent; the first reason wins.
 
 Completion, failure, or watchdog expiry normally moves straight to `paused`.
 Structured gates remain visible instead:
@@ -267,6 +273,25 @@ and `pause_action` (`:continued`, `:applied`, or `:cleared`). Permission
 decisions add `gate_outcome`, `action_id`, and action details needed to audit a
 rejection. These fields are additive; the existing state and continuation
 identity metadata remains present.
+
+## Host configuration handoff
+
+When a host needs to replace the live Agent process because its effective
+configuration changed, `quiesce/2` provides one atomic boundary:
+
+```elixir
+case ObanCodex.Agent.quiesce("triage-7", :config_handoff) do
+  :paused -> :safe_to_replace
+  :armed -> :wait_for_paused
+  :already_paused -> :safe_to_replace
+end
+```
+
+An idle agent pauses immediately. A running turn is allowed to complete. A
+question or permission gate remains visible and receives one answer or
+approval continuation before pausing; rejection pauses immediately. The first
+armed reason wins, and transition telemetry uses `cause: :quiesce`. The host
+still owns persistence, replacement, and any replay of durable prompts.
 
 ## Emergency pause
 

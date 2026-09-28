@@ -51,6 +51,7 @@ defmodule ObanCodex.Agent do
 
   @typedoc "A safe-boundary pause retained from its source turn until resume."
   @type pause_latch :: %{
+          cause: :pause_after_turn | :quiesce,
           reason: term(),
           source_generation: String.t(),
           source_turn_id: String.t(),
@@ -268,10 +269,11 @@ defmodule ObanCodex.Agent do
   Latch a pause at the current turn's next safe boundary.
 
   This is the correlated counterpart to `emergency_pause/1`. The caller must
-  pass the complete job metadata captured for the live turn. The call returns
-  only after the Agent has validated the instance generation and logical turn
-  id and stored the latch, so a following `job_finished/3` cannot race ahead
-  of it.
+  pass the complete job metadata captured for the turn. The turn may still be
+  running or may have just completed into a question or permission gate. The
+  call returns only after the Agent has validated the instance generation and
+  logical turn id and stored the latch, so a following `job_finished/3` cannot
+  race ahead of it.
 
   Ordinary completion, failure, or watchdog expiry applies the pause. An
   `ask_user` or `request_permission` directive remains visible instead; one
@@ -283,6 +285,22 @@ defmodule ObanCodex.Agent do
   def pause_after_turn(agent_id, reason, captured_meta) do
     call(agent_id, {:pause_after_turn, reason, captured_meta})
   end
+
+  @doc """
+  Move an agent to a safe paused boundary for host-managed replacement.
+
+  An idle agent pauses immediately. A running agent arms a pause for the
+  current turn; an agent behind a question or permission gate keeps that gate,
+  allows its one continuation, and pauses when the continuation reaches a safe
+  boundary. An already paused agent is left unchanged.
+
+  Unlike `pause_after_turn/3`, this call is initiated by the host and does not
+  require captured job metadata. The state check and latch installation happen
+  atomically inside the Agent process.
+  """
+  @spec quiesce(agent_id(), term()) ::
+          :paused | :armed | :already_paused | {:error, :agent_not_running}
+  def quiesce(agent_id, reason), do: call(agent_id, {:quiesce, reason})
 
   @doc "Asynchronously force the agent into `:paused` lockdown, from any state. Drops any pending action or question."
   @spec emergency_pause(agent_id()) :: :ok | {:error, :agent_not_running}
@@ -298,9 +316,9 @@ defmodule ObanCodex.Agent do
   The agent's bookkeeping in one map. `:session_id` remains the legacy default
   arc handle; `:session_arcs`, `:active_arc_id`, and `:continuation` expose the
   named-arc state and the current or most recent fresh/resume decision. Also
-  includes `:state`, `:turns`, accumulated `:cost_usd`, any pending gate, and
-  the `t:pause_latch/0` under `:deferred_pause` when a safe-boundary pause is
-  active.
+  includes `:state`, `:turns`, accumulated `:cost_usd`, any pending gate, the
+  host's optional `:config_revision`, and the `t:pause_latch/0` under
+  `:deferred_pause` when a safe-boundary pause is active.
   """
   @spec info(agent_id()) :: {:ok, map()} | {:error, :agent_not_running}
   def info(agent_id), do: call(agent_id, :info)

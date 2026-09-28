@@ -26,8 +26,8 @@ defmodule ObanCodex.Agent.Instance do
       description, fresh id, `{:approval_incomplete, reason}` in history):
       the work was approved but not completed, and a re-approval resumes it
     * `:paused` -- lockdown via `:emergency_pause`, or a correlated
-      `pause_after_turn` latch applied at a safe terminal boundary; every call
-      is refused until an explicit `resume`
+      `pause_after_turn` or `quiesce` latch applied at a safe terminal
+      boundary; every call is refused until an explicit `resume`
 
   Every state change atomically synchronizes the registry value -- the state
   atom, paired with the pending action or question in the gated states -- so
@@ -35,9 +35,10 @@ defmodule ObanCodex.Agent.Instance do
   change also emits `[:oban_codex, :agent, :transition]` telemetry with
   `%{agent_id, from, to}` metadata (state atoms). Turn transitions also carry
   the wrapper-owned generation, turn and arc identities, plus the optional
-  application `correlation_id`. Deferred-pause transitions add `:cause`,
-  `:pause_reason`, and `:pause_action`; gate decisions also add
-  `:gate_outcome` and, for permission gates, `:action_id`.
+  application `correlation_id`. Lifecycle telemetry carries the host's
+  optional `config_revision`. Deferred-pause transitions add `:cause`,
+  `:pause_reason`, and `:pause_action`; gate decisions also add `:gate_outcome`
+  and, for permission gates, `:action_id`.
 
   Codex thread ids are retained in bounded, host-named conversation arcs.
   Prompts that omit an arc use `"default"`, preserving the original one-agent,
@@ -66,6 +67,10 @@ defmodule ObanCodex.Agent.Instance do
       `%{}`
     * `:max_session_arcs` -- maximum retained provider handles; least-recently
       used inactive arcs are evicted as new ones arrive; default 32
+    * `:config_revision` -- optional non-empty opaque string supplied by the
+      host. It is exposed in Agent info, job metadata, and lifecycle telemetry
+      so the host can attribute work to the effective configuration that
+      produced it; default `nil`
     * `:enqueue_fun` -- a 2-arity `(args, meta) -> {:ok, term} | {:error, term}`
       override of the enqueue itself, for tests (no Oban, no DB)
   """
@@ -90,7 +95,8 @@ defmodule ObanCodex.Agent.Instance do
     # without bound. Newest entries win; the cap is per-entry, not per-turn.
     max_history: 500,
     session_arcs: %{},
-    max_session_arcs: 32
+    max_session_arcs: 32,
+    config_revision: nil
   }
 
   def child_spec({agent_id, config}) do
@@ -120,6 +126,7 @@ defmodule ObanCodex.Agent.Instance do
     config = Map.merge(@defaults, Map.new(config))
     validate_string_keys!(:args, config.args)
     validate_string_keys!(:approved_args, config.approved_args)
+    validate_config_revision!(config.config_revision)
     arcs = SessionArcs.new(config.session_arcs, config.max_session_arcs)
 
     data = %{
@@ -131,6 +138,10 @@ defmodule ObanCodex.Agent.Instance do
       cost_usd: 0.0,
       pending_action: nil,
       pending_question: nil,
+      # Continuation identity of the completed turn that owns the currently
+      # visible gate. Unlike last_continuation, this survives a failed attempt
+      # to enqueue the answer or approval continuation.
+      gate_turn: nil,
       deferred_pause: nil,
       generation: identity_token(),
       current_turn: nil,
@@ -193,7 +204,8 @@ defmodule ObanCodex.Agent.Instance do
       cost_usd: data.cost_usd,
       pending_action: data.pending_action,
       pending_question: data.pending_question,
-      deferred_pause: public_pause_latch(data.deferred_pause)
+      deferred_pause: public_pause_latch(data.deferred_pause),
+      config_revision: data.config.config_revision
     }
 
     {:keep_state_and_data, [{:reply, from, {:ok, info}}]}
@@ -207,32 +219,49 @@ defmodule ObanCodex.Agent.Instance do
     if same_pause_identity?(data, meta) do
       {:keep_state_and_data, [{:reply, from, :ok}]}
     else
-      case identity_status(data, meta) do
-        :ok when state != :running ->
-          {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, state}}}]}
-
-        :ok when is_nil(data.deferred_pause) ->
-          latch = %{
-            reason: reason,
-            source_generation: Map.fetch!(meta, "agent_generation"),
-            source_turn_id: Map.fetch!(meta, "agent_turn_id"),
-            owner_generation: Map.fetch!(meta, "agent_generation"),
-            owner_turn_id: Map.fetch!(meta, "agent_turn_id"),
-            owner_arc_id: data.current_turn.continuation.arc_id,
-            owner_correlation_id: data.current_turn.continuation.correlation_id,
-            owner_continuation: data.current_turn.continuation
-          }
-
-          data = %{record(data, {:pause_after_turn, reason}) | deferred_pause: latch}
+      case pause_identity_status(state, data, meta) do
+        {:ok, continuation} when is_nil(data.deferred_pause) ->
+          data = install_deferred_pause(data, reason, :pause_after_turn, continuation)
           {:keep_state, data, [{:reply, from, :ok}]}
 
-        :ok ->
+        {:ok, _continuation} ->
           {:keep_state_and_data, [{:reply, from, :ok}]}
 
         {:error, identity_reason} ->
           {:keep_state_and_data, [{:reply, from, {:error, identity_reason}}]}
       end
     end
+  end
+
+  # Host-initiated configuration handoff. This is a single state-machine call,
+  # so a status transition cannot race between inspection and latch install.
+  defp process_event(:idle, {:call, from}, {:quiesce, reason}, data) do
+    data =
+      data
+      |> record({:quiesced, reason})
+      |> with_transition(%{
+        cause: :quiesce,
+        pause_reason: reason,
+        pause_action: :applied
+      })
+
+    {:next_state, :paused, data, [{:reply, from, :paused}]}
+  end
+
+  defp process_event(:paused, {:call, from}, {:quiesce, _reason}, _data) do
+    {:keep_state_and_data, [{:reply, from, :already_paused}]}
+  end
+
+  defp process_event(state, {:call, from}, {:quiesce, reason}, data)
+       when state in [:running, :waiting_for_user, :awaiting_permission] do
+    data =
+      if is_nil(data.deferred_pause) do
+        install_deferred_pause(data, reason, :quiesce, quiesce_owner(state, data))
+      else
+        data
+      end
+
+    {:keep_state, data, [{:reply, from, :armed}]}
   end
 
   # "Drops active scopes": a pending action, question, or in-flight approval
@@ -244,6 +273,7 @@ defmodule ObanCodex.Agent.Instance do
       record(data, {:paused_from, state})
       | pending_action: nil,
         pending_question: nil,
+        gate_turn: nil,
         in_flight_approval: nil,
         deferred_pause: nil
     }
@@ -263,6 +293,7 @@ defmodule ObanCodex.Agent.Instance do
       data
       | pending_action: nil,
         pending_question: nil,
+        gate_turn: nil,
         in_flight_approval: nil,
         deferred_pause: nil,
         transition_context: %{}
@@ -376,6 +407,7 @@ defmodule ObanCodex.Agent.Instance do
     candidate =
       data
       |> Map.put(:pending_question, nil)
+      |> Map.put(:gate_turn, nil)
       |> continue_deferred_pause(%{gate_outcome: :answered})
       |> prompt_data(opts, data.active_arc_id)
 
@@ -386,6 +418,7 @@ defmodule ObanCodex.Agent.Instance do
     candidate =
       data
       |> Map.put(:pending_question, nil)
+      |> Map.put(:gate_turn, nil)
       |> continue_deferred_pause(%{gate_outcome: :answered})
       |> prompt_data(opts, data.active_arc_id)
 
@@ -413,10 +446,12 @@ defmodule ObanCodex.Agent.Instance do
 
       {%{id: ^id, description: description}, []} ->
         prompt = "Approved: #{description}. Proceed."
+        fallback_data = data
 
         data = %{
           data
           | pending_action: nil,
+            gate_turn: nil,
             in_flight_approval: %{description: description}
         }
 
@@ -429,7 +464,7 @@ defmodule ObanCodex.Agent.Instance do
           data,
           Map.merge(data.config.approved_args, args),
           :awaiting_permission,
-          %{data | pending_action: %{id: id, description: description}, in_flight_approval: nil}
+          fallback_data
         )
 
       _ ->
@@ -441,7 +476,7 @@ defmodule ObanCodex.Agent.Instance do
     case data.pending_action do
       %{id: ^id, description: description} ->
         Logger.info("ObanCodex.Agent #{data.id}: action #{id} rejected: #{reason}")
-        data = %{record(data, {:denied, id, reason}) | pending_action: nil}
+        data = %{record(data, {:denied, id, reason}) | pending_action: nil, gate_turn: nil}
 
         case data.deferred_pause do
           nil ->
@@ -602,12 +637,12 @@ defmodule ObanCodex.Agent.Instance do
 
     case directive(result) do
       {:ask_user, question} ->
-        data = %{data | pending_question: question}
+        data = %{data | pending_question: question, gate_turn: data.last_continuation}
         {:next_state, :waiting_for_user, continue_deferred_pause(data)}
 
       {:request_permission, description} ->
         action = %{id: action_id(), description: description}
-        data = %{data | pending_action: action}
+        data = %{data | pending_action: action, gate_turn: data.last_continuation}
         {:next_state, :awaiting_permission, continue_deferred_pause(data)}
 
       :none ->
@@ -635,7 +670,11 @@ defmodule ObanCodex.Agent.Instance do
 
     data =
       data
-      |> Map.merge(%{pending_action: action, in_flight_approval: nil})
+      |> Map.merge(%{
+        pending_action: action,
+        gate_turn: data.last_continuation,
+        in_flight_approval: nil
+      })
       |> continue_deferred_pause()
 
     {:next_state, :awaiting_permission, data}
@@ -675,7 +714,11 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp deferred_pause_context(data, action) do
-    %{cause: :pause_after_turn, pause_reason: data.deferred_pause.reason, pause_action: action}
+    %{
+      cause: data.deferred_pause.cause,
+      pause_reason: data.deferred_pause.reason,
+      pause_action: action
+    }
     |> put_continuation_identity(data.deferred_pause.owner_continuation)
   end
 
@@ -772,6 +815,7 @@ defmodule ObanCodex.Agent.Instance do
       "continuation_decision" => to_string(continuation.decision),
       "continuation_reason" => to_string(continuation.reason)
     }
+    |> maybe_put_meta("config_revision", data.config.config_revision)
     |> maybe_put_meta("correlation_id", continuation.correlation_id)
     |> maybe_put_meta("session_id", continuation.session_id)
     |> maybe_put_meta("fork_from_arc_id", continuation.fork_from_arc_id)
@@ -881,6 +925,80 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp identity_status(_data, _meta), do: {:error, :malformed_identity}
+
+  defp pause_identity_status(:running, data, meta) do
+    case identity_status(data, meta) do
+      :ok -> {:ok, data.current_turn.continuation}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp pause_identity_status(state, data, meta)
+       when state in [:waiting_for_user, :awaiting_permission] do
+    parked_identity_status(data, meta)
+  end
+
+  defp pause_identity_status(state, data, meta) do
+    case identity_status(data, meta) do
+      :ok -> {:error, {:invalid_state, state}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parked_identity_status(data, meta) when is_map(meta) do
+    generation = Map.get(meta, "agent_generation")
+    turn_id = Map.get(meta, "agent_turn_id")
+    parked = data.gate_turn
+
+    cond do
+      Map.get(meta, "agent_id") !== data.id ->
+        {:error, :agent_id_mismatch}
+
+      not valid_identity_token?(generation) or not valid_identity_token?(turn_id) ->
+        {:error, :malformed_identity}
+
+      generation != data.generation ->
+        {:error, :foreign_generation}
+
+      is_nil(parked) ->
+        {:error, :retired_turn}
+
+      turn_id != parked.agent_turn_id ->
+        {:error, :stale_turn}
+
+      true ->
+        {:ok, parked}
+    end
+  end
+
+  defp parked_identity_status(_data, _meta), do: {:error, :malformed_identity}
+
+  defp quiesce_owner(:running, data), do: data.current_turn.continuation
+
+  defp quiesce_owner(state, data) when state in [:waiting_for_user, :awaiting_permission],
+    do: data.gate_turn
+
+  defp install_deferred_pause(data, reason, cause, continuation) do
+    latch = %{
+      cause: cause,
+      reason: reason,
+      source_generation: continuation.agent_generation,
+      source_turn_id: continuation.agent_turn_id,
+      owner_generation: continuation.agent_generation,
+      owner_turn_id: continuation.agent_turn_id,
+      owner_arc_id: continuation.arc_id,
+      owner_correlation_id: continuation.correlation_id,
+      owner_continuation: continuation
+    }
+
+    history_entry =
+      case cause do
+        :pause_after_turn -> {:pause_after_turn, reason}
+        :quiesce -> {:quiesce, reason}
+      end
+
+    %{record(data, history_entry) | deferred_pause: latch}
+  end
 
   defp transfer_deferred_pause(%{deferred_pause: nil} = data, _continuation), do: data
 
@@ -1170,6 +1288,7 @@ defmodule ObanCodex.Agent.Instance do
         outcome: continuation.outcome,
         outcome_reason: continuation.outcome_reason
       }
+      |> maybe_put_meta(:config_revision, data.config.config_revision)
       |> maybe_put_meta(:fork_from_arc_id, continuation.fork_from_arc_id)
       |> maybe_put_meta(:source_session_id, continuation.source_session_id)
       |> maybe_put_meta(:replaced_session_id, continuation.replaced_session_id)
@@ -1223,6 +1342,7 @@ defmodule ObanCodex.Agent.Instance do
     %{agent_id: data.id, from: from, to: to}
     |> Map.merge(data.transition_context)
     |> put_continuation_identity(continuation)
+    |> maybe_put_meta(:config_revision, data.config.config_revision)
   end
 
   defp put_continuation_identity(meta, nil), do: meta
@@ -1257,5 +1377,17 @@ defmodule ObanCodex.Agent.Instance do
               "ObanCodex.Agent config `#{key}` keys must be strings, got #{inspect(bad)}. " <>
                 "Build the map with ObanCodex.Args.defaults/1 (atom keys in, string map out)."
     end
+  end
+
+  defp validate_config_revision!(nil), do: :ok
+
+  defp validate_config_revision!(revision)
+       when is_binary(revision) and byte_size(revision) in 1..256,
+       do: :ok
+
+  defp validate_config_revision!(revision) do
+    raise ArgumentError,
+          "ObanCodex.Agent config `config_revision` must be nil or a non-empty string " <>
+            "up to 256 bytes, got #{inspect(revision)}"
   end
 end
