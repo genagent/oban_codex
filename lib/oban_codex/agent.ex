@@ -49,6 +49,27 @@ defmodule ObanCodex.Agent do
           | {:awaiting_permission, %{id: String.t(), description: String.t()}}
           | {:waiting_for_user, String.t() | nil}
 
+  @typedoc "A safe-boundary pause retained from its source turn until resume."
+  @type pause_latch :: %{
+          reason: term(),
+          source_generation: String.t(),
+          source_turn_id: String.t(),
+          owner_generation: String.t(),
+          owner_turn_id: String.t(),
+          owner_arc_id: String.t(),
+          owner_correlation_id: String.t() | nil
+        }
+
+  @typedoc "A correlated safe-boundary pause validation failure."
+  @type pause_after_turn_error ::
+          :agent_not_running
+          | :agent_id_mismatch
+          | :malformed_identity
+          | :foreign_generation
+          | :retired_turn
+          | :stale_turn
+          | {:invalid_state, atom()}
+
   @doc """
   Spawn a new agent under the dynamic supervisor.
 
@@ -237,10 +258,30 @@ defmodule ObanCodex.Agent do
     call(agent_id, {:approve_action, action_id, Keyword.get(opts, :args, %{})})
   end
 
-  @doc "Reject the pending action: the denial is recorded and the agent returns to `:idle`."
+  @doc "Reject the pending action. Records the denial and returns to `:idle`, or `:paused` when a safe-boundary pause is latched."
   @spec reject_action(agent_id(), String.t(), String.t()) :: :rejected | {:error, term()}
   def reject_action(agent_id, action_id, reason \\ "denied") do
     call(agent_id, {:reject_action, action_id, reason})
+  end
+
+  @doc """
+  Latch a pause at the current turn's next safe boundary.
+
+  This is the correlated counterpart to `emergency_pause/1`. The caller must
+  pass the complete job metadata captured for the live turn. The call returns
+  only after the Agent has validated the instance generation and logical turn
+  id and stored the latch, so a following `job_finished/3` cannot race ahead
+  of it.
+
+  Ordinary completion, failure, or watchdog expiry applies the pause. An
+  `ask_user` or `request_permission` directive remains visible instead; one
+  answer or approval continuation is allowed, with the latch retained until
+  that continuation completes or opens another gate. Repeating the call with
+  the same captured identity is idempotent and keeps the first reason.
+  """
+  @spec pause_after_turn(agent_id(), term(), map()) :: :ok | {:error, pause_after_turn_error()}
+  def pause_after_turn(agent_id, reason, captured_meta) do
+    call(agent_id, {:pause_after_turn, reason, captured_meta})
   end
 
   @doc "Asynchronously force the agent into `:paused` lockdown, from any state. Drops any pending action or question."
@@ -257,7 +298,9 @@ defmodule ObanCodex.Agent do
   The agent's bookkeeping in one map. `:session_id` remains the legacy default
   arc handle; `:session_arcs`, `:active_arc_id`, and `:continuation` expose the
   named-arc state and the current or most recent fresh/resume decision. Also
-  includes `:state`, `:turns`, accumulated `:cost_usd`, and any pending gate.
+  includes `:state`, `:turns`, accumulated `:cost_usd`, any pending gate, and
+  the `t:pause_latch/0` under `:deferred_pause` when a safe-boundary pause is
+  active.
   """
   @spec info(agent_id()) :: {:ok, map()} | {:error, :agent_not_running}
   def info(agent_id), do: call(agent_id, :info)

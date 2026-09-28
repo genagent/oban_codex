@@ -20,12 +20,14 @@ defmodule ObanCodex.Agent.Instance do
     * `:awaiting_permission` -- the last turn requested approval (directive
       `"request_permission"`); `approve` resumes the session with the action
       (under `:approved_args`, plus any per-approval `:args`, see below), `reject` records the denial and
-      returns to `:idle`, and prompts are `:postpone`d until the gate clears.
+      returns to `:idle` (or `:paused` with a safe-boundary latch), and prompts
+      are `:postpone`d until the gate clears.
       An approved turn that fails or hits the watchdog RE-GATES (same
       description, fresh id, `{:approval_incomplete, reason}` in history):
       the work was approved but not completed, and a re-approval resumes it
-    * `:paused` -- lockdown via `:emergency_pause`; every call is refused until
-      an explicit `resume`
+    * `:paused` -- lockdown via `:emergency_pause`, or a correlated
+      `pause_after_turn` latch applied at a safe terminal boundary; every call
+      is refused until an explicit `resume`
 
   Every state change atomically synchronizes the registry value -- the state
   atom, paired with the pending action or question in the gated states -- so
@@ -33,7 +35,9 @@ defmodule ObanCodex.Agent.Instance do
   change also emits `[:oban_codex, :agent, :transition]` telemetry with
   `%{agent_id, from, to}` metadata (state atoms). Turn transitions also carry
   the wrapper-owned generation, turn and arc identities, plus the optional
-  application `correlation_id`.
+  application `correlation_id`. Deferred-pause transitions add `:cause`,
+  `:pause_reason`, and `:pause_action`; gate decisions also add
+  `:gate_outcome` and, for permission gates, `:action_id`.
 
   Codex thread ids are retained in bounded, host-named conversation arcs.
   Prompts that omit an arc use `"default"`, preserving the original one-agent,
@@ -127,6 +131,7 @@ defmodule ObanCodex.Agent.Instance do
       cost_usd: 0.0,
       pending_action: nil,
       pending_question: nil,
+      deferred_pause: nil,
       generation: identity_token(),
       current_turn: nil,
       # set while an approve continuation is in flight: an approved turn that
@@ -142,7 +147,8 @@ defmodule ObanCodex.Agent.Instance do
       continuation_request: :resume,
       fork_from_arc_id: nil,
       correlation_id: nil,
-      last_continuation: nil
+      last_continuation: nil,
+      transition_context: %{}
     }
 
     {:ok, :idle, data}
@@ -155,11 +161,11 @@ defmodule ObanCodex.Agent.Instance do
   def handle_event(type, content, state, data) do
     case process_event(state, type, content, data) do
       {:next_state, next, new_data} when next != state ->
-        sync_transition(state, next, new_data)
+        new_data = sync_transition(state, next, new_data)
         {:next_state, next, new_data}
 
       {:next_state, next, new_data, actions} when next != state ->
-        sync_transition(state, next, new_data)
+        new_data = sync_transition(state, next, new_data)
         {:next_state, next, new_data, actions}
 
       other ->
@@ -186,10 +192,47 @@ defmodule ObanCodex.Agent.Instance do
       turns: data.turns,
       cost_usd: data.cost_usd,
       pending_action: data.pending_action,
-      pending_question: data.pending_question
+      pending_question: data.pending_question,
+      deferred_pause: public_pause_latch(data.deferred_pause)
     }
 
     {:keep_state_and_data, [{:reply, from, {:ok, info}}]}
+  end
+
+  # Synchronous and correlated: the reply is the caller's guarantee that the
+  # latch was installed before a later asynchronous job completion can be
+  # handled. Exact retries are idempotent, including after the source turn has
+  # opened a gate or its one allowed continuation has started.
+  defp process_event(state, {:call, from}, {:pause_after_turn, reason, meta}, data) do
+    if same_pause_identity?(data, meta) do
+      {:keep_state_and_data, [{:reply, from, :ok}]}
+    else
+      case identity_status(data, meta) do
+        :ok when state != :running ->
+          {:keep_state_and_data, [{:reply, from, {:error, {:invalid_state, state}}}]}
+
+        :ok when is_nil(data.deferred_pause) ->
+          latch = %{
+            reason: reason,
+            source_generation: Map.fetch!(meta, "agent_generation"),
+            source_turn_id: Map.fetch!(meta, "agent_turn_id"),
+            owner_generation: Map.fetch!(meta, "agent_generation"),
+            owner_turn_id: Map.fetch!(meta, "agent_turn_id"),
+            owner_arc_id: data.current_turn.continuation.arc_id,
+            owner_correlation_id: data.current_turn.continuation.correlation_id,
+            owner_continuation: data.current_turn.continuation
+          }
+
+          data = %{record(data, {:pause_after_turn, reason}) | deferred_pause: latch}
+          {:keep_state, data, [{:reply, from, :ok}]}
+
+        :ok ->
+          {:keep_state_and_data, [{:reply, from, :ok}]}
+
+        {:error, identity_reason} ->
+          {:keep_state_and_data, [{:reply, from, {:error, identity_reason}}]}
+      end
+    end
   end
 
   # "Drops active scopes": a pending action, question, or in-flight approval
@@ -201,10 +244,31 @@ defmodule ObanCodex.Agent.Instance do
       record(data, {:paused_from, state})
       | pending_action: nil,
         pending_question: nil,
-        in_flight_approval: nil
+        in_flight_approval: nil,
+        deferred_pause: nil
     }
 
+    data =
+      with_transition(data, %{
+        cause: :emergency_pause,
+        pause_reason: :emergency_pause,
+        pause_action: :applied
+      })
+
     {:next_state, :paused, data}
+  end
+
+  defp process_event(:paused, :cast, :emergency_pause, data) do
+    data = %{
+      data
+      | pending_action: nil,
+        pending_question: nil,
+        in_flight_approval: nil,
+        deferred_pause: nil,
+        transition_context: %{}
+    }
+
+    {:keep_state, data}
   end
 
   # ---------------------------------------------------------------------------
@@ -212,6 +276,7 @@ defmodule ObanCodex.Agent.Instance do
   # ---------------------------------------------------------------------------
 
   defp process_event(:paused, {:call, from}, :resume, data) do
+    data = clear_deferred_pause(data)
     {:next_state, :idle, data, [{:reply, from, :resumed}]}
   end
 
@@ -308,12 +373,22 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp process_event(:waiting_for_user, {:call, from}, {:user_prompt, answer, opts}, data) do
-    candidate = prompt_data(%{data | pending_question: nil}, opts, data.active_arc_id)
+    candidate =
+      data
+      |> Map.put(:pending_question, nil)
+      |> continue_deferred_pause(%{gate_outcome: :answered})
+      |> prompt_data(opts, data.active_arc_id)
+
     start_turn(from, answer, candidate, %{}, :waiting_for_user, data)
   end
 
   defp process_event(:waiting_for_user, :cast, {:user_prompt, answer, opts}, data) do
-    candidate = prompt_data(%{data | pending_question: nil}, opts, data.active_arc_id)
+    candidate =
+      data
+      |> Map.put(:pending_question, nil)
+      |> continue_deferred_pause(%{gate_outcome: :answered})
+      |> prompt_data(opts, data.active_arc_id)
+
     start_turn(nil, answer, candidate, %{}, :waiting_for_user, data)
   end
 
@@ -345,6 +420,9 @@ defmodule ObanCodex.Agent.Instance do
             in_flight_approval: %{description: description}
         }
 
+        data =
+          continue_deferred_pause(data, %{gate_outcome: :approved, action_id: id})
+
         start_turn(
           from,
           prompt,
@@ -361,10 +439,25 @@ defmodule ObanCodex.Agent.Instance do
 
   defp process_event(:awaiting_permission, {:call, from}, {:reject_action, id, reason}, data) do
     case data.pending_action do
-      %{id: ^id} ->
+      %{id: ^id, description: description} ->
         Logger.info("ObanCodex.Agent #{data.id}: action #{id} rejected: #{reason}")
         data = %{record(data, {:denied, id, reason}) | pending_action: nil}
-        {:next_state, :idle, data, [{:reply, from, :rejected}]}
+
+        case data.deferred_pause do
+          nil ->
+            {:next_state, :idle, data, [{:reply, from, :rejected}]}
+
+          _latch ->
+            data =
+              apply_deferred_pause(data, %{
+                gate_outcome: :rejected,
+                action_id: id,
+                action: description,
+                rejection_reason: reason
+              })
+
+            {:next_state, :paused, data, [{:reply, from, :rejected}]}
+        end
 
       _ ->
         {:keep_state_and_data, [{:reply, from, {:error, :unknown_action}}]}
@@ -417,7 +510,12 @@ defmodule ObanCodex.Agent.Instance do
     case prepare_turn(data, base_args, turn_id) do
       {:ok, continuation} ->
         current_turn = %{id: turn_id, retry_watermark: 0, continuation: continuation}
-        data = %{data | current_turn: current_turn, last_continuation: continuation}
+
+        data =
+          data
+          |> Map.merge(%{current_turn: current_turn, last_continuation: continuation})
+          |> transfer_deferred_pause(continuation)
+
         watchdog = watchdog(data)
 
         {:next_state, :running, record(data, {:prompt, prompt}),
@@ -426,7 +524,12 @@ defmodule ObanCodex.Agent.Instance do
       {:error, reason} ->
         failed = continuation_failure(data, reason, :enqueue_failed, turn_id)
         emit_completion(data, failed)
-        fallback_data = %{fallback_data | last_continuation: failed}
+
+        fallback_data = %{
+          fallback_data
+          | last_continuation: failed,
+            transition_context: %{}
+        }
 
         {:next_state, fallback_state, record(fallback_data, {:enqueue_failed, reason}),
          reply(from, {:error, {:enqueue_failed, reason}})}
@@ -499,14 +602,16 @@ defmodule ObanCodex.Agent.Instance do
 
     case directive(result) do
       {:ask_user, question} ->
-        {:next_state, :waiting_for_user, %{data | pending_question: question}}
+        data = %{data | pending_question: question}
+        {:next_state, :waiting_for_user, continue_deferred_pause(data)}
 
       {:request_permission, description} ->
         action = %{id: action_id(), description: description}
-        {:next_state, :awaiting_permission, %{data | pending_action: action}}
+        data = %{data | pending_action: action}
+        {:next_state, :awaiting_permission, continue_deferred_pause(data)}
 
       :none ->
-        {:next_state, :idle, data}
+        pause_or_idle(data)
     end
   end
 
@@ -521,13 +626,61 @@ defmodule ObanCodex.Agent.Instance do
   # dropping the elevation on the floor. The captured session id means a
   # re-approval resumes the interrupted work. Unapproved turns fall to :idle.
   defp regate_or_idle(%{in_flight_approval: nil} = data, _reason) do
-    {:next_state, :idle, data}
+    pause_or_idle(data)
   end
 
   defp regate_or_idle(%{in_flight_approval: %{description: description}} = data, reason) do
     action = %{id: action_id(), description: description}
     data = record(data, {:approval_incomplete, reason})
-    {:next_state, :awaiting_permission, %{data | pending_action: action, in_flight_approval: nil}}
+
+    data =
+      data
+      |> Map.merge(%{pending_action: action, in_flight_approval: nil})
+      |> continue_deferred_pause()
+
+    {:next_state, :awaiting_permission, data}
+  end
+
+  defp pause_or_idle(%{deferred_pause: nil} = data), do: {:next_state, :idle, data}
+
+  defp pause_or_idle(data) do
+    {:next_state, :paused, apply_deferred_pause(data)}
+  end
+
+  defp continue_deferred_pause(data, extra \\ %{})
+
+  defp continue_deferred_pause(%{deferred_pause: nil} = data, _extra), do: data
+
+  defp continue_deferred_pause(data, extra) do
+    with_transition(
+      data,
+      Map.merge(deferred_pause_context(data, :continued), extra)
+    )
+  end
+
+  defp apply_deferred_pause(data, extra \\ %{}) do
+    reason = data.deferred_pause.reason
+
+    data
+    |> record({:paused_after_turn, reason})
+    |> with_transition(Map.merge(deferred_pause_context(data, :applied), extra))
+  end
+
+  defp clear_deferred_pause(%{deferred_pause: nil} = data), do: data
+
+  defp clear_deferred_pause(data) do
+    data
+    |> with_transition(deferred_pause_context(data, :cleared))
+    |> Map.put(:deferred_pause, nil)
+  end
+
+  defp deferred_pause_context(data, action) do
+    %{cause: :pause_after_turn, pause_reason: data.deferred_pause.reason, pause_action: action}
+    |> put_continuation_identity(data.deferred_pause.owner_continuation)
+  end
+
+  defp with_transition(data, context) do
+    %{data | transition_context: Map.merge(data.transition_context, context)}
   end
 
   # Fold a turn's payload into the data: a history entry (the decoded
@@ -728,6 +881,40 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp identity_status(_data, _meta), do: {:error, :malformed_identity}
+
+  defp transfer_deferred_pause(%{deferred_pause: nil} = data, _continuation), do: data
+
+  defp transfer_deferred_pause(data, continuation) do
+    latch = %{
+      data.deferred_pause
+      | owner_generation: continuation.agent_generation,
+        owner_turn_id: continuation.agent_turn_id,
+        owner_arc_id: continuation.arc_id,
+        owner_correlation_id: continuation.correlation_id,
+        owner_continuation: continuation
+    }
+
+    %{data | deferred_pause: latch}
+  end
+
+  defp public_pause_latch(nil), do: nil
+  defp public_pause_latch(latch), do: Map.delete(latch, :owner_continuation)
+
+  defp same_pause_identity?(%{deferred_pause: nil}, _meta), do: false
+
+  defp same_pause_identity?(%{deferred_pause: latch} = data, meta) when is_map(meta) do
+    source? =
+      Map.get(meta, "agent_generation") == latch.source_generation and
+        Map.get(meta, "agent_turn_id") == latch.source_turn_id
+
+    owner? =
+      Map.get(meta, "agent_generation") == latch.owner_generation and
+        Map.get(meta, "agent_turn_id") == latch.owner_turn_id
+
+    Map.get(meta, "agent_id") === data.id and (source? or owner?)
+  end
+
+  defp same_pause_identity?(_data, _meta), do: false
 
   defp same_identity?(left, right) do
     Enum.all?(~w(agent_id agent_generation agent_turn_id), fn key ->
@@ -1021,6 +1208,8 @@ defmodule ObanCodex.Agent.Instance do
       %{system_time: System.system_time()},
       transition_meta(from, to, data)
     )
+
+    %{data | transition_context: %{}}
   end
 
   defp transition_meta(from, to, data) do
@@ -1032,6 +1221,7 @@ defmodule ObanCodex.Agent.Instance do
       end
 
     %{agent_id: data.id, from: from, to: to}
+    |> Map.merge(data.transition_context)
     |> put_continuation_identity(continuation)
   end
 

@@ -52,6 +52,14 @@ defmodule ObanCodex.AgentTest do
     Agent.job_retrying(id, retry, meta)
   end
 
+  defp start_latched_turn!(opts \\ [], reason \\ :daily_budget, prompt_opts \\ []) do
+    id = start_agent!(opts)
+    :processing = Agent.submit_prompt(id, "turn", prompt_opts)
+    assert_receive {:captured_turn, ^id, meta}
+    :ok = Agent.pause_after_turn(id, reason, meta)
+    {id, meta}
+  end
+
   defp fail_turn_start(:raise), do: raise("turn start failed")
   defp fail_turn_start(:throw), do: throw(:turn_start_failed)
   defp fail_turn_start(:exit), do: exit(:turn_start_failed)
@@ -1255,6 +1263,429 @@ defmodule ObanCodex.AgentTest do
       assert :processing = Task.await(caller)
       assert_receive {:enqueued, %{"prompt" => "next thing"}, _meta}
       assert {:ok, :running} = Agent.status(id)
+    end
+  end
+
+  describe "pause_after_turn/3" do
+    test "validates turn ownership synchronously and keeps the first reason idempotently" do
+      id = start_agent!()
+
+      assert {:error, :agent_id_mismatch} = Agent.pause_after_turn(id, :rail, %{})
+
+      assert {:error, :malformed_identity} =
+               Agent.pause_after_turn(id, :rail, %{"agent_id" => id})
+
+      :processing = Agent.submit_prompt(id, "turn")
+      assert_receive {:captured_turn, ^id, meta}
+
+      assert {:error, :malformed_identity} =
+               Agent.pause_after_turn(id, :rail, %{"agent_id" => id})
+
+      assert {:error, :stale_turn} =
+               Agent.pause_after_turn(id, :rail, Map.put(meta, "agent_turn_id", "stale"))
+
+      assert {:error, :foreign_generation} =
+               Agent.pause_after_turn(id, :rail, Map.put(meta, "agent_generation", "foreign"))
+
+      assert {:error, :agent_id_mismatch} =
+               Agent.pause_after_turn(id, :rail, Map.put(meta, "agent_id", "other"))
+
+      assert :ok = Agent.pause_after_turn(id, :daily_budget, meta)
+      assert :ok = Agent.pause_after_turn(id, :different_reason, meta)
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  reason: :daily_budget,
+                  source_generation: generation,
+                  source_turn_id: turn_id,
+                  owner_generation: generation,
+                  owner_turn_id: turn_id,
+                  owner_arc_id: "default",
+                  owner_correlation_id: nil
+                }
+              }} = Agent.info(id)
+
+      assert generation == meta["agent_generation"]
+      assert turn_id == meta["agent_turn_id"]
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+
+      # An exact retry remains idempotent after the source turn is retired.
+      assert :ok = Agent.pause_after_turn(id, :third_reason, meta)
+      assert {:ok, %{deferred_pause: %{reason: :daily_budget}}} = Agent.info(id)
+
+      retired_id = start_agent!()
+      :processing = Agent.submit_prompt(retired_id, "retire")
+      assert_receive {:captured_turn, ^retired_id, retired_meta}
+      :ok = Agent.job_finished(retired_id, {:ok, result("done")}, retired_meta)
+      assert {:ok, :idle} = Agent.await(retired_id, :idle, 1_000)
+
+      assert {:error, :retired_turn} =
+               Agent.pause_after_turn(retired_id, :too_late, retired_meta)
+    end
+
+    test "ordinary completion and terminal failure apply the deferred pause" do
+      {success_id, success_meta} = start_latched_turn!([], :success_rail)
+      :ok = Agent.job_finished(success_id, {:ok, result("done")}, success_meta)
+      assert {:ok, :paused} = Agent.await(success_id, :paused, 1_000)
+
+      {failure_id, failure_meta} = start_latched_turn!([], :failure_rail)
+
+      :ok =
+        Agent.job_finished(
+          failure_id,
+          {:error, {:cancel, :policy_stop}, error(:policy_stop)},
+          failure_meta
+        )
+
+      assert {:ok, :paused} = Agent.await(failure_id, :paused, 1_000)
+    end
+
+    test "a queued prompt cannot leak into a new turn after the latch applies" do
+      {id, meta} = start_latched_turn!()
+      queued = Task.async(fn -> Agent.submit_prompt(id, "must not run") end)
+      refute_receive {:enqueued, %{"prompt" => "must not run"}, _meta}, 50
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      assert {:error, :paused} = Task.await(queued, 1_000)
+      refute_receive {:enqueued, %{"prompt" => "must not run"}, _meta}, 50
+    end
+
+    test "ask_user stays visible and one answer continuation pauses at its boundary" do
+      {id, meta} = start_latched_turn!([], :answer_rail)
+
+      turn =
+        structured_result(%{"directive" => "ask_user", "question" => "which environment?"},
+          session_id: "question-session"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, turn}, meta)
+
+      assert {:ok, {:waiting_for_user, "which environment?"}} =
+               Agent.await(id, :waiting_for_user, 1_000)
+
+      assert :ok = Agent.pause_after_turn(id, :duplicate, meta)
+      assert :processing = Agent.submit_prompt(id, "staging")
+
+      assert_receive {:captured_turn, ^id, continuation_meta}
+      assert_receive {:enqueued, %{"prompt" => "staging", "session_id" => "question-session"}, _}
+
+      # The live continuation identity is also an idempotent latch request and
+      # cannot replace the original reason.
+      assert :ok = Agent.pause_after_turn(id, :continuation_reason, continuation_meta)
+
+      :ok = Agent.job_finished(id, {:ok, result("answered")}, continuation_meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  reason: :answer_rail,
+                  owner_generation: owner_generation,
+                  owner_turn_id: owner_turn_id,
+                  owner_arc_id: "default",
+                  owner_correlation_id: nil
+                }
+              }} = Agent.info(id)
+
+      assert owner_generation == continuation_meta["agent_generation"]
+      assert owner_turn_id == continuation_meta["agent_turn_id"]
+      assert :ok = Agent.pause_after_turn(id, :retired_continuation_retry, continuation_meta)
+      assert {:ok, %{deferred_pause: %{reason: :answer_rail}}} = Agent.info(id)
+    end
+
+    test "request_permission stays visible and one approval continuation then pauses" do
+      {id, meta} = start_latched_turn!([], :approval_rail)
+
+      request =
+        structured_result(
+          %{"directive" => "request_permission", "action" => "rewrite lib/core.ex"},
+          session_id: "approval-session"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert :processing = Agent.approve_action(id, action_id)
+      assert_receive {:captured_turn, ^id, continuation_meta}
+
+      assert_receive {:enqueued,
+                      %{"prompt" => "Approved: " <> _, "session_id" => "approval-session"}, _}
+
+      :ok = Agent.job_finished(id, {:ok, result("approved work complete")}, continuation_meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+    end
+
+    test "an incomplete approved continuation re-gates and rejection pauses with audit metadata" do
+      handler = "deferred-pause-rejection-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :transition],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:deferred_transition, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {id, meta} =
+        start_latched_turn!([], :approval_rail,
+          arc_id: "review",
+          correlation_id: "rail-request"
+        )
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"},
+          session_id: "approval-session"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert_receive {:deferred_transition,
+                      %{
+                        from: :running,
+                        to: :awaiting_permission,
+                        cause: :pause_after_turn,
+                        pause_reason: :approval_rail,
+                        pause_action: :continued
+                      }}
+
+      assert {:ok, {:awaiting_permission, %{id: first_action_id}}} = Agent.status(id)
+      :processing = Agent.approve_action(id, first_action_id)
+      assert_receive {:captured_turn, ^id, continuation_meta}
+
+      assert_receive {:deferred_transition,
+                      %{
+                        from: :awaiting_permission,
+                        to: :running,
+                        gate_outcome: :approved,
+                        action_id: ^first_action_id,
+                        pause_action: :continued
+                      }}
+
+      :ok =
+        Agent.job_finished(
+          id,
+          {:error, {:cancel, :timeout}, error(:timeout)},
+          continuation_meta
+        )
+
+      assert {:ok, {:awaiting_permission, %{id: next_action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert next_action_id != first_action_id
+      assert :rejected = Agent.reject_action(id, next_action_id, "stop here")
+      assert {:ok, :paused} = Agent.status(id)
+
+      assert_receive {:deferred_transition,
+                      %{
+                        from: :awaiting_permission,
+                        to: :paused,
+                        cause: :pause_after_turn,
+                        pause_reason: :approval_rail,
+                        pause_action: :applied,
+                        gate_outcome: :rejected,
+                        action_id: ^next_action_id,
+                        action: "deploy",
+                        rejection_reason: "stop here",
+                        agent_generation: rejected_generation,
+                        agent_turn_id: rejected_turn_id,
+                        arc_id: "review",
+                        correlation_id: "rail-request"
+                      }}
+
+      assert rejected_generation == continuation_meta["agent_generation"]
+      assert rejected_turn_id == continuation_meta["agent_turn_id"]
+    end
+
+    test "a latched approved continuation that hits its watchdog re-gates" do
+      {id, meta} = start_latched_turn!([job_timeout: 50], :watchdog_rail)
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"})
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      :processing = Agent.approve_action(id, action_id)
+
+      assert {:ok, {:awaiting_permission, %{id: next_action_id, description: "deploy"}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert next_action_id != action_id
+      assert {:ok, %{deferred_pause: %{reason: :watchdog_rail}}} = Agent.info(id)
+    end
+
+    test "a failed continuation enqueue cannot leak its gate outcome into a later pause" do
+      handler = "deferred-pause-fallback-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :transition],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:fallback_transition, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = "fallback-#{System.unique_integer([:positive])}"
+
+      enqueue_fun = fn args, meta ->
+        send(test_pid, {:captured_turn, id, meta})
+
+        if String.starts_with?(args["prompt"], "Approved:") do
+          {:error, :db_down}
+        else
+          {:ok, :queued}
+        end
+      end
+
+      {:ok, _pid} = Agent.start_agent(id, enqueue_fun: enqueue_fun)
+      :processing = Agent.submit_prompt(id, "plan")
+      assert_receive {:captured_turn, ^id, meta}
+      :ok = Agent.pause_after_turn(id, :daily_budget, meta)
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"})
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert {:error, {:enqueue_failed, :db_down}} = Agent.approve_action(id, action_id)
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+      assert_receive {:captured_turn, ^id, failed_continuation_meta}
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  owner_generation: owner_generation,
+                  owner_turn_id: owner_turn_id
+                }
+              }} = Agent.info(id)
+
+      assert owner_generation == meta["agent_generation"]
+      assert owner_turn_id == meta["agent_turn_id"]
+      refute owner_turn_id == failed_continuation_meta["agent_turn_id"]
+
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+
+      assert_receive {:fallback_transition,
+                      %{
+                        from: :awaiting_permission,
+                        to: :paused,
+                        cause: :emergency_pause,
+                        pause_reason: :emergency_pause,
+                        pause_action: :applied
+                      } = transition}
+
+      refute Map.has_key?(transition, :gate_outcome)
+      refute Map.has_key?(transition, :action_id)
+    end
+
+    test "resume clears an applied latch and emergency pause clears a live latch" do
+      handler = "deferred-pause-clear-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :transition],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:pause_transition, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {id, meta} = start_latched_turn!([], :resume_rail)
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      assert {:ok, %{deferred_pause: %{reason: :resume_rail}}} = Agent.info(id)
+
+      assert :resumed = Agent.resume_agent(id)
+      assert {:ok, %{state: :idle, deferred_pause: nil}} = Agent.info(id)
+
+      assert_receive {:pause_transition,
+                      %{
+                        from: :paused,
+                        to: :idle,
+                        cause: :pause_after_turn,
+                        pause_reason: :resume_rail,
+                        pause_action: :cleared,
+                        agent_generation: generation,
+                        agent_turn_id: turn_id
+                      }}
+
+      assert generation == meta["agent_generation"]
+      assert turn_id == meta["agent_turn_id"]
+
+      :processing = Agent.submit_prompt(id, "next")
+      assert_receive {:captured_turn, ^id, next_meta}
+      :ok = Agent.pause_after_turn(id, :emergency_rail, next_meta)
+      :ok = Agent.emergency_pause(id)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      assert {:ok, %{deferred_pause: nil}} = Agent.info(id)
+
+      assert {:error, {:invalid_state, :paused}} =
+               Agent.pause_after_turn(id, :too_late, next_meta)
+
+      assert {:ok, before_repeat} = Agent.history(id)
+      :ok = Agent.emergency_pause(id)
+      settle(id)
+      assert {:ok, ^before_repeat} = Agent.history(id)
+
+      late_gate =
+        structured_result(%{"directive" => "request_permission", "action" => "late"})
+
+      :ok = Agent.job_finished(id, {:ok, late_gate}, next_meta)
+      settle(id)
+      assert {:ok, %{state: :paused, pending_action: nil, deferred_pause: nil}} = Agent.info(id)
+    end
+
+    test "watchdog expiry applies the latch and retry callbacks retain it" do
+      {watchdog_id, _watchdog_meta} =
+        start_latched_turn!([job_timeout: 50], :watchdog_rail)
+
+      assert {:ok, :paused} = Agent.await(watchdog_id, :paused, 1_000)
+      assert {:ok, watchdog_history} = Agent.history(watchdog_id)
+      assert :watchdog_timeout in watchdog_history
+      assert {:paused_after_turn, :watchdog_rail} in watchdog_history
+
+      {retry_id, retry_meta} = start_latched_turn!([job_timeout: 1_000], :retry_rail)
+
+      :ok =
+        Agent.job_retrying(
+          retry_id,
+          %{attempt: 1, max_attempts: 3, verdict: {:error, :timeout}},
+          retry_meta
+        )
+
+      settle(retry_id)
+
+      assert {:ok, %{state: :running, deferred_pause: %{reason: :retry_rail}}} =
+               Agent.info(retry_id)
+
+      :ok = Agent.job_finished(retry_id, {:ok, result("retry complete")}, retry_meta)
+      assert {:ok, :paused} = Agent.await(retry_id, :paused, 1_000)
     end
   end
 

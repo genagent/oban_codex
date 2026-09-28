@@ -77,7 +77,7 @@ code that only depends on the Oban-facing seam should feel familiar.
 | testing | result/error/query fixtures and sequences | same concepts, encoded as real Codex JSONL |
 | task CLI | `run`, `doctor`, `args` | same |
 | installer | SQLite/Lite Igniter scaffold | same |
-| Agent lifecycle | Instance, Job, Supervisor, Tick | same state machine and facade |
+| Agent lifecycle | Instance, Job, Supervisor, Tick, correlated safe-boundary pause | same state machine and facade |
 
 Provider semantics intentionally differ:
 
@@ -302,6 +302,24 @@ stays `0.0` unless a custom error payload reports cost. `fork_arc/5` forks one
 arc's Codex thread into another arc and runs a prompt on the fork, leaving the
 source arc untouched.
 
+Host policy can pause safely without hiding a directive returned by the same
+turn. Pass the live job metadata to the synchronous correlated call:
+
+```elixir
+:ok =
+  ObanCodex.Agent.pause_after_turn(
+    "triage-7",
+    :daily_budget,
+    captured_job_meta
+  )
+```
+
+Ordinary completion, failure, retry exhaustion, or watchdog expiry then lands
+in `paused`. A question or permission request stays gated. Its answer or
+approval receives one continuation, and the latch applies when that work
+reaches a terminal boundary. `resume_agent/1` clears the latch;
+`emergency_pause/1` remains the immediate scope-dropping brake.
+
 See [Agent lifecycle](guides/agent_lifecycle.md).
 
 ## Testing without Codex
@@ -354,6 +372,8 @@ Each turn emits:
 
 Run measurements include native `duration` and `cost_usd: 0.0`. Metadata can
 contain prompts and raw output; redact before exporting it.
+Deferred-pause transitions add `cause`, `pause_reason`, and `pause_action`.
+Permission decisions may also include `gate_outcome` and `action_id`.
 
 ## Fleet safety
 
