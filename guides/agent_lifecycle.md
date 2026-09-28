@@ -314,8 +314,9 @@ trigger a directive while paused.
 
 `info` includes state, the default session id, all retained `session_arcs`,
 the active arc, the current or most recent continuation, turns, pending scopes,
-the optional `deferred_pause` latch, and `cost_usd`. Codex doesn't report price,
-so cost stays `0.0` unless a custom error payload provides one.
+the optional `deferred_pause` latch, the applied `pause_context` while paused,
+and `cost_usd`. Codex doesn't report price, so cost stays `0.0` unless a custom
+error payload provides one.
 
 ## Offline tests
 

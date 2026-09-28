@@ -318,7 +318,8 @@ defmodule ObanCodex.Agent do
   named-arc state and the current or most recent fresh/resume decision. Also
   includes `:state`, `:turns`, accumulated `:cost_usd`, any pending gate, the
   host's optional `:config_revision`, and the `t:pause_latch/0` under
-  `:deferred_pause` when a safe-boundary pause is active.
+  `:deferred_pause` when a safe-boundary pause is active. While paused,
+  `:pause_context` retains the metadata that applied the pause.
   """
   @spec info(agent_id()) :: {:ok, map()} | {:error, :agent_not_running}
   def info(agent_id), do: call(agent_id, :info)

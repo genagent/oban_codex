@@ -143,6 +143,7 @@ defmodule ObanCodex.Agent.Instance do
       # to enqueue the answer or approval continuation.
       gate_turn: nil,
       deferred_pause: nil,
+      pause_context: nil,
       generation: identity_token(),
       current_turn: nil,
       # set while an approve continuation is in flight: an approved turn that
@@ -205,6 +206,7 @@ defmodule ObanCodex.Agent.Instance do
       pending_action: data.pending_action,
       pending_question: data.pending_question,
       deferred_pause: public_pause_latch(data.deferred_pause),
+      pause_context: data.pause_context,
       config_revision: data.config.config_revision
     }
 
@@ -278,12 +280,7 @@ defmodule ObanCodex.Agent.Instance do
         deferred_pause: nil
     }
 
-    data =
-      with_transition(data, %{
-        cause: :emergency_pause,
-        pause_reason: :emergency_pause,
-        pause_action: :applied
-      })
+    data = with_transition(data, emergency_pause_context())
 
     {:next_state, :paused, data}
   end
@@ -296,6 +293,7 @@ defmodule ObanCodex.Agent.Instance do
         gate_turn: nil,
         in_flight_approval: nil,
         deferred_pause: nil,
+        pause_context: emergency_pause_context(),
         transition_context: %{}
     }
 
@@ -1320,6 +1318,8 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp sync_transition(from, to, data) do
+    data = retain_pause_context(from, to, data)
+
     Registry.update_value(@registry, data.id, fn _old -> status_value(to, data) end)
 
     :telemetry.execute(
@@ -1330,6 +1330,14 @@ defmodule ObanCodex.Agent.Instance do
 
     %{data | transition_context: %{}}
   end
+
+  defp retain_pause_context(_from, :paused, data),
+    do: %{data | pause_context: data.transition_context}
+
+  defp retain_pause_context(:paused, _to, data),
+    do: %{data | pause_context: nil}
+
+  defp retain_pause_context(_from, _to, data), do: data
 
   defp transition_meta(from, to, data) do
     continuation =
@@ -1353,6 +1361,14 @@ defmodule ObanCodex.Agent.Instance do
     |> Map.put(:agent_turn_id, continuation.agent_turn_id)
     |> Map.put(:arc_id, continuation.arc_id)
     |> maybe_put_meta(:correlation_id, continuation.correlation_id)
+  end
+
+  defp emergency_pause_context do
+    %{
+      cause: :emergency_pause,
+      pause_reason: :emergency_pause,
+      pause_action: :applied
+    }
   end
 
   # The registry value `ObanCodex.Agent.status/1` serves: the gated states
