@@ -104,6 +104,17 @@ defmodule ObanCodex.AgentTest do
 
       assert message =~ "keys must be strings"
     end
+
+    test "config_revision must be nil or a bounded non-empty string" do
+      for revision <- ["", String.duplicate("x", 257), 42] do
+        id = "bad-revision-#{System.unique_integer([:positive])}"
+
+        assert {:error, %ArgumentError{message: message}} =
+                 Agent.start_agent(id, config_revision: revision)
+
+        assert message =~ "config_revision"
+      end
+    end
   end
 
   describe ":idle -> :running" do
@@ -172,6 +183,51 @@ defmodule ObanCodex.AgentTest do
 
       assert_receive {:lifecycle, [:oban_codex, :agent, :transition],
                       %{from: :running, to: :idle, correlation_id: ^correlation_id}}
+    end
+
+    test "config revision joins info, job metadata, and lifecycle telemetry" do
+      handler = "agent-config-revision-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach_many(
+          handler,
+          [
+            [:oban_codex, :agent, :transition],
+            [:oban_codex, :agent, :turn_completed]
+          ],
+          fn event, _measurements, meta, _config ->
+            send(test_pid, {:revision_lifecycle, event, meta})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = start_agent!(config_revision: "cfg-42")
+      assert {:ok, %{config_revision: "cfg-42"}} = Agent.info(id)
+
+      assert :processing = Agent.submit_prompt(id, "run")
+
+      assert_receive {:captured_turn, ^id, %{"config_revision" => "cfg-42"} = captured}
+      assert_receive {:enqueued, %{"prompt" => "run"}, ^captured}
+
+      assert_receive {:revision_lifecycle, [:oban_codex, :agent, :transition],
+                      %{from: :idle, to: :running, config_revision: "cfg-42"}}
+
+      :ok = Agent.job_finished(id, {:ok, result("done")}, captured)
+
+      assert_receive {:revision_lifecycle, [:oban_codex, :agent, :turn_completed],
+                      %{config_revision: "cfg-42", outcome: :completed}}
+
+      assert_receive {:revision_lifecycle, [:oban_codex, :agent, :transition],
+                      %{from: :running, to: :idle, config_revision: "cfg-42"}}
+
+      nil_id = start_agent!()
+      assert {:ok, %{config_revision: nil}} = Agent.info(nil_id)
+      assert :processing = Agent.submit_prompt(nil_id, "no revision")
+      assert_receive {:captured_turn, ^nil_id, nil_meta}
+      refute Map.has_key?(nil_meta, "config_revision")
     end
 
     test "config default args ride under the prompt; approved_args do not" do
@@ -1343,6 +1399,114 @@ defmodule ObanCodex.AgentTest do
       assert {:ok, :paused} = Agent.await(failure_id, :paused, 1_000)
     end
 
+    test "can latch the matching completed turn after it parks on a question" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "plan")
+      assert_receive {:captured_turn, ^id, meta}
+
+      question =
+        structured_result(%{"directive" => "ask_user", "question" => "which environment?"},
+          session_id: "question-session"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, question}, meta)
+
+      assert {:ok, {:waiting_for_user, "which environment?"}} =
+               Agent.await(id, :waiting_for_user, 1_000)
+
+      assert {:error, :stale_turn} =
+               Agent.pause_after_turn(id, :stale, Map.put(meta, "agent_turn_id", "stale"))
+
+      assert :ok = Agent.pause_after_turn(id, :config_handoff, meta)
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  cause: :pause_after_turn,
+                  reason: :config_handoff,
+                  source_turn_id: source_turn_id,
+                  owner_turn_id: owner_turn_id
+                }
+              }} = Agent.info(id)
+
+      assert source_turn_id == meta["agent_turn_id"]
+      assert owner_turn_id == meta["agent_turn_id"]
+      assert :processing = Agent.submit_prompt(id, "staging")
+      assert_receive {:captured_turn, ^id, continuation_meta}
+
+      :ok = Agent.job_finished(id, {:ok, result("answered")}, continuation_meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+    end
+
+    test "can latch the matching completed turn behind permission and rejection pauses" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "deploy")
+      assert_receive {:captured_turn, ^id, meta}
+
+      request =
+        structured_result(%{
+          "directive" => "request_permission",
+          "action" => "deploy production"
+        })
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert :ok = Agent.pause_after_turn(id, :config_handoff, meta)
+      assert :rejected = Agent.reject_action(id, action_id, "not now")
+      assert {:ok, :paused} = Agent.status(id)
+      assert {:ok, %{deferred_pause: %{cause: :pause_after_turn}}} = Agent.info(id)
+    end
+
+    test "a failed gate continuation enqueue does not replace the parked turn identity" do
+      id = "parked-gate-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      enqueue_fun = fn args, meta ->
+        send(test_pid, {:captured_turn, id, meta})
+
+        if String.starts_with?(args["prompt"], "Approved:") do
+          {:error, :db_down}
+        else
+          {:ok, :queued}
+        end
+      end
+
+      {:ok, _pid} = Agent.start_agent(id, enqueue_fun: enqueue_fun)
+      :processing = Agent.submit_prompt(id, "deploy")
+      assert_receive {:captured_turn, ^id, gate_meta}
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"})
+
+      :ok = Agent.job_finished(id, {:ok, request}, gate_meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert {:error, {:enqueue_failed, :db_down}} = Agent.approve_action(id, action_id)
+      assert_receive {:captured_turn, ^id, failed_meta}
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+
+      assert {:error, :stale_turn} =
+               Agent.pause_after_turn(id, :wrong_owner, failed_meta)
+
+      assert :ok = Agent.pause_after_turn(id, :config_handoff, gate_meta)
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  source_turn_id: source_turn_id,
+                  owner_turn_id: owner_turn_id
+                }
+              }} = Agent.info(id)
+
+      assert source_turn_id == gate_meta["agent_turn_id"]
+      assert owner_turn_id == gate_meta["agent_turn_id"]
+    end
+
     test "a queued prompt cannot leak into a new turn after the latch applies" do
       {id, meta} = start_latched_turn!()
       queued = Task.async(fn -> Agent.submit_prompt(id, "must not run") end)
@@ -1686,6 +1850,148 @@ defmodule ObanCodex.AgentTest do
 
       :ok = Agent.job_finished(retry_id, {:ok, result("retry complete")}, retry_meta)
       assert {:ok, :paused} = Agent.await(retry_id, :paused, 1_000)
+    end
+  end
+
+  describe "quiesce/2" do
+    test "pauses idle atomically and reports an already paused agent" do
+      handler = "quiesce-idle-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :transition],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:quiesce_transition, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = start_agent!(config_revision: "cfg-idle")
+      assert :paused = Agent.quiesce(id, :config_handoff)
+      assert {:ok, :paused} = Agent.status(id)
+      assert :already_paused = Agent.quiesce(id, :ignored)
+
+      assert {:ok, %{deferred_pause: nil}} = Agent.info(id)
+      assert {:ok, history} = Agent.history(id)
+      assert {:quiesced, :config_handoff} in history
+
+      assert_receive {:quiesce_transition,
+                      %{
+                        from: :idle,
+                        to: :paused,
+                        cause: :quiesce,
+                        pause_reason: :config_handoff,
+                        pause_action: :applied,
+                        config_revision: "cfg-idle"
+                      }}
+
+      assert {:error, :agent_not_running} = Agent.quiesce("offline", :config_handoff)
+    end
+
+    test "arms the running turn and prevents queued prompts from crossing the boundary" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "current")
+      assert_receive {:captured_turn, ^id, meta}
+
+      queued = Task.async(fn -> Agent.submit_prompt(id, "next config only") end)
+      assert :armed = Agent.quiesce(id, :config_handoff)
+      assert :armed = Agent.quiesce(id, :different_reason)
+
+      assert {:ok,
+              %{
+                deferred_pause: %{
+                  cause: :quiesce,
+                  reason: :config_handoff,
+                  source_turn_id: source_turn_id
+                }
+              }} = Agent.info(id)
+
+      assert source_turn_id == meta["agent_turn_id"]
+      :ok = Agent.job_finished(id, {:ok, result("done")}, meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+      assert {:error, :paused} = Task.await(queued, 1_000)
+      refute_receive {:enqueued, %{"prompt" => "next config only"}, _meta}, 50
+    end
+
+    test "retains a question gate for one continuation before pausing" do
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "plan")
+      assert_receive {:captured_turn, ^id, meta}
+
+      question =
+        structured_result(%{"directive" => "ask_user", "question" => "which environment?"},
+          session_id: "question-session"
+        )
+
+      :ok = Agent.job_finished(id, {:ok, question}, meta)
+
+      assert {:ok, {:waiting_for_user, "which environment?"}} =
+               Agent.await(id, :waiting_for_user, 1_000)
+
+      assert :armed = Agent.quiesce(id, :config_handoff)
+      assert {:ok, {:waiting_for_user, "which environment?"}} = Agent.status(id)
+
+      assert {:ok, %{deferred_pause: %{source_turn_id: source_turn_id}}} = Agent.info(id)
+      assert source_turn_id == meta["agent_turn_id"]
+
+      assert :processing = Agent.submit_prompt(id, "staging")
+      assert_receive {:captured_turn, ^id, continuation_meta}
+
+      assert {:ok, %{deferred_pause: %{cause: :quiesce, owner_turn_id: owner_turn_id}}} =
+               Agent.info(id)
+
+      assert owner_turn_id == continuation_meta["agent_turn_id"]
+      :ok = Agent.job_finished(id, {:ok, result("answered")}, continuation_meta)
+      assert {:ok, :paused} = Agent.await(id, :paused, 1_000)
+    end
+
+    test "retains a permission gate and rejection pauses immediately" do
+      handler = "quiesce-reject-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:oban_codex, :agent, :transition],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:quiesce_reject_transition, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      id = start_agent!()
+      :processing = Agent.submit_prompt(id, "deploy")
+      assert_receive {:captured_turn, ^id, meta}
+
+      request =
+        structured_result(%{"directive" => "request_permission", "action" => "deploy"})
+
+      :ok = Agent.job_finished(id, {:ok, request}, meta)
+
+      assert {:ok, {:awaiting_permission, %{id: action_id}}} =
+               Agent.await(id, :awaiting_permission, 1_000)
+
+      assert :armed = Agent.quiesce(id, :config_handoff)
+      assert {:ok, {:awaiting_permission, %{id: ^action_id}}} = Agent.status(id)
+      assert :rejected = Agent.reject_action(id, action_id, "stop")
+      assert {:ok, :paused} = Agent.status(id)
+
+      assert_receive {:quiesce_reject_transition,
+                      %{
+                        from: :awaiting_permission,
+                        to: :paused,
+                        cause: :quiesce,
+                        pause_reason: :config_handoff,
+                        pause_action: :applied,
+                        gate_outcome: :rejected,
+                        action_id: ^action_id
+                      }}
     end
   end
 

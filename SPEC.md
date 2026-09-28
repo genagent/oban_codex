@@ -134,14 +134,21 @@ completed failures return to idle or re-gate an incomplete approved action.
 The captured Codex thread id is placed in the next turn's `"session_id"`.
 
 `Agent.pause_after_turn/3` is the provider-independent, correlated
-safe-boundary pause. It synchronously validates the live job's agent,
-generation, and turn id before latching the first reason. Ordinary terminal
-completion, failure, and watchdog expiry apply the latch. `ask_user` and
-`request_permission` remain gated; one answer or approval continuation carries
-the latch, and a new or incomplete gate keeps it. Rejection of a latched
-permission request goes directly to `paused`. Resume clears the latch, while
-emergency pause stays immediate and drops scopes plus the latch. Retry attempts
-retain it for the same logical turn.
+safe-boundary pause. It synchronously validates the job's agent, generation,
+and turn id before latching the first reason. The matching turn may be running
+or parked after completion in `waiting_for_user` or `awaiting_permission`.
+Ordinary terminal completion, failure, and watchdog expiry apply the latch.
+`ask_user` and `request_permission` remain gated; one answer or approval
+continuation carries the latch, and a new or incomplete gate keeps it.
+Rejection of a latched permission request goes directly to `paused`. Resume
+clears the latch, while emergency pause stays immediate and drops scopes plus
+the latch. Retry attempts retain it for the same logical turn.
+
+`Agent.quiesce/2` is the atomic host-initiated configuration handoff. Idle
+agents pause immediately; running turns and parked gates arm the same
+safe-boundary behavior without requiring job metadata. An already paused agent
+is unchanged. The latch's `cause` distinguishes `:quiesce` from
+`:pause_after_turn` in `info/1` and transition telemetry.
 
 The latch records immutable source and latest-owner identities, including the
 owner arc and application correlation id, so retries of either correlated call
@@ -149,6 +156,10 @@ are idempotent after the corresponding turn retires.
 Transition telemetry adds `cause`, `pause_reason`, and `pause_action` on these
 paths, plus `gate_outcome` and `action_id` for permission decisions. Existing
 consumers continue to receive the original state and continuation metadata.
+An optional bounded `config_revision` supplied at Agent start is opaque to the
+provider and appears in `info/1`, Agent job metadata, transition telemetry, and
+turn-completion telemetry. `Agent.Tick` forwards it from its JSON-clean start
+map.
 
 ## Backlog
 
