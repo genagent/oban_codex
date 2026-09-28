@@ -21,10 +21,10 @@ children = [
 
 The supervisor owns a Registry and DynamicSupervisor. Agents exist only while
 their processes are alive. Oban durably retains queued jobs and retry attempts,
-but it does not restore an Agent's arcs, history, pending gate, or current turn
-after that process stops. Seed persisted arc handles when starting the
-replacement. It has a new generation and rejects late callbacks from the
-earlier process.
+but it does not restore an Agent's arcs, history, pending gate, deferred-pause
+latch, or current turn after that process stops. Seed persisted arc handles
+when starting the replacement. It has a new generation and rejects late
+callbacks from the earlier process.
 
 ## Start an agent
 
@@ -69,7 +69,7 @@ Configuration:
 | `running` | an Oban turn is in flight |
 | `waiting_for_user` | structured directive asked a question |
 | `awaiting_permission` | structured directive requested an action |
-| `paused` | emergency lockdown |
+| `paused` | emergency lockdown or an applied safe-boundary pause |
 | `offline` | no registered process |
 
 ```elixir
@@ -195,6 +195,10 @@ callbacks to `ObanCodex.Agent.Job` inherit this behavior automatically.
 
 Tune `job_timeout` above one command timeout plus the largest expected backoff.
 
+A `pause_after_turn/3` latch survives retry callbacks for the same logical
+turn. A terminal retry result applies it, and a watchdog expiry applies it just
+like any other terminal boundary.
+
 ## Scheduling
 
 `ObanCodex.Agent.Tick` adapts `Oban.Plugins.Cron` to the lifecycle by delivering
@@ -222,6 +226,48 @@ Tick policies are `if_busy` (`"skip"` by default or `"queue"`), `if_offline`
 `queues: [agents: 2, ticks: 1]`; a tick on the Agent turn queue can wait behind
 the work whose busy state it is meant to observe.
 
+## Safe-boundary pause
+
+A host rail may trip while a turn is still producing the permission request or
+question that the operator must see. `pause_after_turn/3` installs a correlated
+latch without interrupting that result:
+
+```elixir
+:ok =
+  ObanCodex.Agent.pause_after_turn(
+    "triage-7",
+    :daily_budget,
+    captured_job_meta
+  )
+```
+
+The call is synchronous. It validates the job metadata's agent, instance
+generation, and logical turn inside the state machine, then replies only after
+the latch is stored. A matching completion cannot overtake the latch. Repeating
+the request for its source turn or latest continuation is idempotent; the first
+reason wins.
+
+Completion, failure, or watchdog expiry normally moves straight to `paused`.
+Structured gates remain visible instead:
+
+- `ask_user` stays in `waiting_for_user`; one operator answer may run.
+- `request_permission` stays in `awaiting_permission`; one approval may run.
+- a continuation that opens a new gate, fails after approval, or times out
+  remains gated with the latch attached.
+- rejecting a latched permission request moves directly to `paused`.
+
+Prompts queued behind the turn or gate cannot start another turn after the
+latch applies. The Agent answers synchronous callers with `{:error, :paused}`
+and records dropped cast prompts. `info/1` exposes the reason plus immutable
+source identity and the latest owner's generation, turn, arc, and correlation
+identities under `:deferred_pause`. `resume_agent/1` clears that latch.
+
+Relevant transition telemetry adds `cause: :pause_after_turn`, `pause_reason`,
+and `pause_action` (`:continued`, `:applied`, or `:cleared`). Permission
+decisions add `gate_outcome`, `action_id`, and action details needed to audit a
+rejection. These fields are additive; the existing state and continuation
+identity metadata remains present.
+
 ## Emergency pause
 
 ```elixir
@@ -230,8 +276,9 @@ the work whose busy state it is meant to observe.
 :resumed = ObanCodex.Agent.resume_agent("triage-7")
 ```
 
-Pause drops pending question/action scopes. A late result is recorded but cannot
-unlock the agent or trigger a directive while paused.
+Emergency pause is immediate. It drops pending question/action scopes and any
+safe-boundary latch. A late result is recorded but cannot unlock the agent or
+trigger a directive while paused.
 
 ## Inspection
 
@@ -242,8 +289,8 @@ unlock the agent or trigger a directive while paused.
 
 `info` includes state, the default session id, all retained `session_arcs`,
 the active arc, the current or most recent continuation, turns, pending scopes,
-and `cost_usd`. Codex doesn't report price, so cost stays `0.0` unless a custom
-error payload provides one.
+the optional `deferred_pause` latch, and `cost_usd`. Codex doesn't report price,
+so cost stays `0.0` unless a custom error payload provides one.
 
 ## Offline tests
 
