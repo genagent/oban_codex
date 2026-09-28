@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.5.1](https://github.com/genagent/oban_codex/compare/v0.5.0...v0.5.1) (2026-09-28)
+
+
+### Bug Fixes
+
+* preserve Agent gates across deferred rail pauses ([#33](https://github.com/genagent/oban_codex/issues/33)) ([8028ef5](https://github.com/genagent/oban_codex/commit/8028ef56b77ab6431cacacc3d2ebec12c877f898))
+
 ## [0.5.0](https://github.com/genagent/oban_codex/compare/v0.4.0...v0.5.0) (2026-09-24)
 
 
