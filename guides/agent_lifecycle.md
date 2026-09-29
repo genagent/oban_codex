@@ -231,6 +231,25 @@ Tick policies are `if_busy` (`"skip"` by default or `"queue"`), `if_offline`
 `queues: [agents: 2, ticks: 1]`; a tick on the Agent turn queue can wait behind
 the work whose busy state it is meant to observe.
 
+A host that owns Agent configuration can atomically admit a tick against the
+revision it expected when building the schedule:
+
+```elixir
+config :oban_codex, :tick_admission, MyApp.TickAdmission
+
+defmodule MyApp.TickAdmission do
+  def admit(:codex, agent_id, expected_config_revision, run) do
+    MyApp.with_current_agent_config(agent_id, expected_config_revision, run)
+  end
+end
+```
+
+`expected_config_revision` is the optional value from the tick's
+`"start"["config_revision"]`. The zero-arity `run` function contains the
+status check, optional Agent start, and prompt delivery. The callback returns
+the Tick worker result and decides whether to invoke `run`. Without
+`:tick_admission`, Tick runs directly with its existing behavior.
+
 ## Safe-boundary pause
 
 A host rail may trip while a turn is still producing the permission request or
@@ -284,6 +303,7 @@ case ObanCodex.Agent.quiesce("triage-7", :config_handoff) do
   :paused -> :safe_to_replace
   :armed -> :wait_for_paused
   :already_paused -> :safe_to_replace
+  :draining -> :wait_for_turn_then_retry_quiesce
 end
 ```
 
@@ -292,6 +312,8 @@ question or permission gate remains visible and receives one answer or
 approval continuation before pausing; rejection pauses immediately. The first
 armed reason wins, and transition telemetry uses `cause: :quiesce`. The host
 still owns persistence, replacement, and any replay of durable prompts.
+`:draining` is not a replacement boundary: an emergency-paused turn still owns
+physical work until its terminal callback is handled.
 
 ## Emergency pause
 
@@ -314,8 +336,9 @@ trigger a directive while paused.
 
 `info` includes state, the default session id, all retained `session_arcs`,
 the active arc, the current or most recent continuation, turns, pending scopes,
-the optional `deferred_pause` latch, and `cost_usd`. Codex doesn't report price,
-so cost stays `0.0` unless a custom error payload provides one.
+the optional `deferred_pause` latch, the applied `pause_context` while paused,
+and `cost_usd`. Codex doesn't report price, so cost stays `0.0` unless a custom
+error payload provides one.
 
 ## Offline tests
 

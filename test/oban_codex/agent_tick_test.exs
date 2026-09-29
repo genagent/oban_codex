@@ -75,6 +75,36 @@ defmodule ObanCodex.Agent.TickTest do
     def insert_job(_conf, changeset, _opts), do: {:ok, Ecto.Changeset.apply_changes(changeset)}
   end
 
+  defmodule TestAdmission do
+    def admit(provider, agent_id, expected_config_revision, context, run) do
+      {test_pid, _mode} =
+        Application.fetch_env!(:oban_codex, :tick_admission_test_control)
+
+      send(test_pid, {:tick_admission_context, context})
+      admit(provider, agent_id, expected_config_revision, run)
+    end
+
+    def admit(provider, agent_id, expected_config_revision, run) do
+      {test_pid, mode} =
+        Application.fetch_env!(:oban_codex, :tick_admission_test_control)
+
+      send(
+        test_pid,
+        {:tick_admission, provider, agent_id, expected_config_revision, is_function(run, 0)}
+      )
+
+      case mode do
+        :run ->
+          result = run.()
+          send(test_pid, {:tick_admission_result, agent_id, result})
+          result
+
+        {:return, result} ->
+          result
+      end
+    end
+  end
+
   setup_all do
     db = Path.join(System.tmp_dir!(), "oban_codex_agent_tick_test.db")
     for suffix <- ["", "-shm", "-wal"], do: File.rm(db <> suffix)
@@ -116,6 +146,17 @@ defmodule ObanCodex.Agent.TickTest do
   end
 
   setup do
+    admission = Application.fetch_env(:oban_codex, :tick_admission)
+    admission_control = Application.fetch_env(:oban_codex, :tick_admission_test_control)
+
+    Application.delete_env(:oban_codex, :tick_admission)
+    Application.delete_env(:oban_codex, :tick_admission_test_control)
+
+    on_exit(fn ->
+      restore_env(:tick_admission, admission)
+      restore_env(:tick_admission_test_control, admission_control)
+    end)
+
     start_supervised!(ObanCodex.Agent.Supervisor)
     Repo.delete_all(from(j in "oban_jobs", select: j.id))
     :ok
@@ -146,6 +187,14 @@ defmodule ObanCodex.Agent.TickTest do
   end
 
   defp tick(args), do: Tick.perform(%Oban.Job{args: args})
+
+  defp configure_admission(mode) do
+    Application.put_env(:oban_codex, :tick_admission, TestAdmission)
+    Application.put_env(:oban_codex, :tick_admission_test_control, {self(), mode})
+  end
+
+  defp restore_env(key, :error), do: Application.delete_env(:oban_codex, key)
+  defp restore_env(key, {:ok, value}), do: Application.put_env(:oban_codex, key, value)
 
   test "delivers to an :idle agent" do
     id = start_agent!()
@@ -210,6 +259,68 @@ defmodule ObanCodex.Agent.TickTest do
 
   test "an offline agent skips by default" do
     assert {:cancel, :agent_not_running} = tick(%{"agent_id" => "ghost", "prompt" => "beat"})
+  end
+
+  test "configured admission encloses the status check and may reject the tick" do
+    configure_admission({:return, {:cancel, :stale_config}})
+
+    assert {:cancel, :stale_config} =
+             tick(%{"agent_id" => "ghost", "prompt" => "beat"})
+
+    assert_receive {:tick_admission, :codex, "ghost", nil, true}
+  end
+
+  test "configured admission receives the expected revision and runs start plus delivery" do
+    configure_admission(:run)
+    id = "tick-admitted-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert :ok =
+             tick(%{
+               "agent_id" => id,
+               "prompt" => "boot beat",
+               "if_offline" => "start",
+               "start" => %{"config_revision" => "cfg-admitted-8"}
+             })
+
+    assert_receive {:tick_admission, :codex, ^id, "cfg-admitted-8", true}
+    assert_receive {:tick_admission_result, ^id, :ok}
+    assert {:ok, :running} = Agent.await(id, :running, 1_000)
+
+    assert %{"agent_id" => ^id, "config_revision" => "cfg-admitted-8"} =
+             Repo.one!(
+               from(j in "oban_jobs",
+                 where: j.worker == "ObanCodex.Agent.Job",
+                 select: j.meta
+               )
+             )
+             |> Jason.decode!()
+  end
+
+  test "configured admission prefers the delivery revision over the process revision" do
+    configure_admission({:return, {:cancel, :stale_delivery}})
+
+    assert {:cancel, :stale_delivery} =
+             tick(%{
+               "agent_id" => "delivery-revision",
+               "prompt" => "current prompt",
+               "delivery_revision" => "delivery-v2",
+               "start" => %{"config_revision" => "process-v1"}
+             })
+
+    assert_receive {:tick_admission, :codex, "delivery-revision", "delivery-v2", true}
+  end
+
+  test "configured admission receives the exact conversation arc context" do
+    configure_admission({:return, {:cancel, :stale_config}})
+
+    assert {:cancel, :stale_config} =
+             tick(%{
+               "agent_id" => "arc-context",
+               "prompt" => "beat",
+               "arc_id" => "scheduled:arc-1"
+             })
+
+    assert_receive {:tick_admission_context, %{arc_id: "scheduled:arc-1"}}
   end
 
   test "if_offline start boots the agent and delivers through the real queue" do

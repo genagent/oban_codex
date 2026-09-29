@@ -59,6 +59,26 @@ defmodule ObanCodex.Agent.Tick do
   A `:paused` agent never receives a tick (`{:cancel, :agent_paused}`) --
   lockdown outranks the schedule, in both `"if_busy"` modes.
 
+  ## Admission
+
+  A host that owns Agent configuration may set `:tick_admission` to a module
+  with `admit/5`:
+
+      config :oban_codex, :tick_admission, MyApp.TickAdmission
+
+      def admit(:codex, agent_id, expected_delivery_revision, context, run) do
+        MyApp.with_current_agent_config(agent_id, expected_delivery_revision, context, run)
+      end
+
+  The callback receives the provider, agent id, the optional top-level
+  `"delivery_revision"`, a context map containing the optional `:arc_id`, and
+  a zero-arity function. Existing `admit/4` callbacks remain supported without
+  the context argument. Jobs without the revision field fall back to
+  `"start"["config_revision"]` for compatibility. The function contains the
+  complete status check, optional Agent start, and prompt delivery. The
+  callback's return value becomes the worker result. With no callback
+  configured, Tick invokes the function directly.
+
   `max_attempts: 1`: a tick is a point-in-time beat; retrying a failed one
   later would deliver a stale prompt (and risk a duplicate), so a missed beat
   is simply missed. The cancels are visible per-beat in the `oban_jobs` table.
@@ -86,9 +106,47 @@ defmodule ObanCodex.Agent.Tick do
         [origin: :tick, session: %{"resume" => :resume, "fresh" => :fresh}[session]]
         |> maybe_add_arc(arc_id)
 
-      tick(agent_id, prompt, opts, if_busy, if_offline, args)
+      admit(agent_id, expected_delivery_revision(args), %{arc_id: arc_id}, fn ->
+        tick(agent_id, prompt, opts, if_busy, if_offline, args)
+      end)
     end
   end
+
+  defp admit(agent_id, expected_config_revision, context, run) do
+    case Application.get_env(:oban_codex, :tick_admission) do
+      nil ->
+        run.()
+
+      module when is_atom(module) ->
+        Code.ensure_loaded?(module)
+
+        cond do
+          function_exported?(module, :admit, 5) ->
+            module.admit(:codex, agent_id, expected_config_revision, context, run)
+
+          function_exported?(module, :admit, 4) ->
+            module.admit(:codex, agent_id, expected_config_revision, run)
+
+          true ->
+            raise ArgumentError,
+                  ":oban_codex, :tick_admission must name a module exporting admit/5 or admit/4, got: " <>
+                    inspect(module)
+        end
+
+      invalid ->
+        raise ArgumentError,
+              ":oban_codex, :tick_admission must be a module or nil, got: " <> inspect(invalid)
+    end
+  end
+
+  defp expected_delivery_revision(%{"delivery_revision" => revision})
+       when is_binary(revision) and revision != "",
+       do: revision
+
+  defp expected_delivery_revision(%{"start" => %{} = start}),
+    do: Map.get(start, "config_revision")
+
+  defp expected_delivery_revision(_args), do: nil
 
   defp tick(agent_id, prompt, opts, if_busy, if_offline, args) do
     case Agent.status(agent_id) do
