@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented here.
 
+## [0.6.0](https://github.com/genagent/oban_codex/compare/v0.5.1...v0.6.0) (2026-09-29)
+
+
+### Features
+
+* add Agent config handoff boundaries (closes [#35](https://github.com/genagent/oban_codex/issues/35)) ([#36](https://github.com/genagent/oban_codex/issues/36)) ([fccbdcd](https://github.com/genagent/oban_codex/commit/fccbdcd4ba7865f0ce5a80381142225bf16d53e5))
+
+
+### Bug Fixes
+
+* harden Agent live-config handoff boundaries ([#38](https://github.com/genagent/oban_codex/issues/38)) ([c9cebea](https://github.com/genagent/oban_codex/commit/c9cebea3b83f3c831ae4f7c27aee765bc467f980))
+
 ## [0.5.1](https://github.com/genagent/oban_codex/compare/v0.5.0...v0.5.1) (2026-09-28)
 
 
