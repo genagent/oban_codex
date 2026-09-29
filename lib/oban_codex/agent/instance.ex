@@ -247,11 +247,13 @@ defmodule ObanCodex.Agent.Instance do
         pause_action: :applied
       })
 
-    {:next_state, :paused, data, [{:reply, from, :paused}]}
+    reply = if is_nil(data.current_turn), do: :paused, else: :draining
+    {:next_state, :paused, data, [{:reply, from, reply}]}
   end
 
-  defp process_event(:paused, {:call, from}, {:quiesce, _reason}, _data) do
-    {:keep_state_and_data, [{:reply, from, :already_paused}]}
+  defp process_event(:paused, {:call, from}, {:quiesce, _reason}, data) do
+    reply = if is_nil(data.current_turn), do: :already_paused, else: :draining
+    {:keep_state_and_data, [{:reply, from, reply}]}
   end
 
   defp process_event(state, {:call, from}, {:quiesce, reason}, data)
@@ -273,36 +275,13 @@ defmodule ObanCodex.Agent.Instance do
   defp process_event(state, :cast, :emergency_pause, data),
     do: process_event(state, :cast, {:emergency_pause, emergency_pause_context()}, data)
 
-  defp process_event(state, :cast, {:emergency_pause, context}, data)
-       when state != :paused and is_map(context) do
-    data = %{
-      record(data, {:paused_from, state})
-      | pending_action: nil,
-        pending_question: nil,
-        gate_turn: nil,
-        in_flight_approval: nil,
-        deferred_pause: nil
-    }
-
-    data = with_transition(data, emergency_pause_context(context))
-
-    {:next_state, :paused, data}
+  defp process_event(state, :cast, {:emergency_pause, context}, data) when is_map(context) do
+    apply_emergency_pause(state, data, context, [])
   end
 
-  defp process_event(:paused, :cast, {:emergency_pause, context}, data)
+  defp process_event(state, {:call, from}, {:emergency_pause, context}, data)
        when is_map(context) do
-    data = %{
-      data
-      | pending_action: nil,
-        pending_question: nil,
-        gate_turn: nil,
-        in_flight_approval: nil,
-        deferred_pause: nil,
-        pause_context: emergency_pause_context(context),
-        transition_context: %{}
-    }
-
-    {:keep_state, data}
+    apply_emergency_pause(state, data, context, [{:reply, from, :ok}])
   end
 
   # ---------------------------------------------------------------------------
@@ -1366,6 +1345,36 @@ defmodule ObanCodex.Agent.Instance do
     |> Map.put(:agent_turn_id, continuation.agent_turn_id)
     |> Map.put(:arc_id, continuation.arc_id)
     |> maybe_put_meta(:correlation_id, continuation.correlation_id)
+  end
+
+  defp apply_emergency_pause(state, data, context, actions) when state != :paused do
+    data = %{
+      record(data, {:paused_from, state})
+      | pending_action: nil,
+        pending_question: nil,
+        gate_turn: nil,
+        in_flight_approval: nil,
+        deferred_pause: nil
+    }
+
+    data = with_transition(data, emergency_pause_context(context))
+
+    {:next_state, :paused, data, actions}
+  end
+
+  defp apply_emergency_pause(:paused, data, context, actions) do
+    data = %{
+      data
+      | pending_action: nil,
+        pending_question: nil,
+        gate_turn: nil,
+        in_flight_approval: nil,
+        deferred_pause: nil,
+        pause_context: emergency_pause_context(context),
+        transition_context: %{}
+    }
+
+    {:keep_state, data, actions}
   end
 
   defp emergency_pause_context do

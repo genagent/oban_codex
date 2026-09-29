@@ -303,6 +303,7 @@ case ObanCodex.Agent.quiesce("triage-7", :config_handoff) do
   :paused -> :safe_to_replace
   :armed -> :wait_for_paused
   :already_paused -> :safe_to_replace
+  :draining -> :wait_for_turn_then_retry_quiesce
 end
 ```
 
@@ -311,6 +312,8 @@ question or permission gate remains visible and receives one answer or
 approval continuation before pausing; rejection pauses immediately. The first
 armed reason wins, and transition telemetry uses `cause: :quiesce`. The host
 still owns persistence, replacement, and any replay of durable prompts.
+`:draining` is not a replacement boundary: an emergency-paused turn still owns
+physical work until its terminal callback is handled.
 
 ## Emergency pause
 

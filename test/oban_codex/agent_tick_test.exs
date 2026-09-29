@@ -76,6 +76,14 @@ defmodule ObanCodex.Agent.TickTest do
   end
 
   defmodule TestAdmission do
+    def admit(provider, agent_id, expected_config_revision, context, run) do
+      {test_pid, _mode} =
+        Application.fetch_env!(:oban_codex, :tick_admission_test_control)
+
+      send(test_pid, {:tick_admission_context, context})
+      admit(provider, agent_id, expected_config_revision, run)
+    end
+
     def admit(provider, agent_id, expected_config_revision, run) do
       {test_pid, mode} =
         Application.fetch_env!(:oban_codex, :tick_admission_test_control)
@@ -300,6 +308,19 @@ defmodule ObanCodex.Agent.TickTest do
              })
 
     assert_receive {:tick_admission, :codex, "delivery-revision", "delivery-v2", true}
+  end
+
+  test "configured admission receives the exact conversation arc context" do
+    configure_admission({:return, {:cancel, :stale_config}})
+
+    assert {:cancel, :stale_config} =
+             tick(%{
+               "agent_id" => "arc-context",
+               "prompt" => "beat",
+               "arc_id" => "scheduled:arc-1"
+             })
+
+    assert_receive {:tick_admission_context, %{arc_id: "scheduled:arc-1"}}
   end
 
   test "if_offline start boots the agent and delivers through the real queue" do

@@ -292,14 +292,17 @@ defmodule ObanCodex.Agent do
   An idle agent pauses immediately. A running agent arms a pause for the
   current turn; an agent behind a question or permission gate keeps that gate,
   allows its one continuation, and pauses when the continuation reaches a safe
-  boundary. An already paused agent is left unchanged.
+  boundary. An already paused agent is left unchanged when it has no retained
+  turn. If an emergency-paused turn has not reported its terminal outcome,
+  `quiesce/2` returns `:draining`; that is not a safe replacement boundary, and
+  the caller should retry after the turn drains.
 
   Unlike `pause_after_turn/3`, this call is initiated by the host and does not
   require captured job metadata. The state check and latch installation happen
   atomically inside the Agent process.
   """
   @spec quiesce(agent_id(), term()) ::
-          :paused | :armed | :already_paused | {:error, :agent_not_running}
+          :paused | :armed | :already_paused | :draining | {:error, :agent_not_running}
   def quiesce(agent_id, reason), do: call(agent_id, {:quiesce, reason})
 
   @doc "Asynchronously force the agent into `:paused` lockdown, from any state. Drops any pending action or question."
@@ -308,10 +311,10 @@ defmodule ObanCodex.Agent do
     with_agent(agent_id, &:gen_statem.cast(&1, :emergency_pause))
   end
 
-  @doc "Asynchronously force the agent into `:paused` while retaining the supplied pause provenance."
+  @doc "Synchronously force the agent into `:paused` and acknowledge retained pause provenance."
   @spec emergency_pause(agent_id(), map()) :: :ok | {:error, :agent_not_running}
   def emergency_pause(agent_id, context) when is_map(context) do
-    with_agent(agent_id, &:gen_statem.cast(&1, {:emergency_pause, context}))
+    call(agent_id, {:emergency_pause, context})
   end
 
   @doc "Release a `:paused` agent back to `:idle`."
