@@ -288,6 +288,20 @@ defmodule ObanCodex.Agent.TickTest do
              |> Jason.decode!()
   end
 
+  test "configured admission prefers the delivery revision over the process revision" do
+    configure_admission({:return, {:cancel, :stale_delivery}})
+
+    assert {:cancel, :stale_delivery} =
+             tick(%{
+               "agent_id" => "delivery-revision",
+               "prompt" => "current prompt",
+               "delivery_revision" => "delivery-v2",
+               "start" => %{"config_revision" => "process-v1"}
+             })
+
+    assert_receive {:tick_admission, :codex, "delivery-revision", "delivery-v2", true}
+  end
+
   test "if_offline start boots the agent and delivers through the real queue" do
     id = "tick-start-" <> Integer.to_string(System.unique_integer([:positive]))
 

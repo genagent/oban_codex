@@ -66,12 +66,13 @@ defmodule ObanCodex.Agent.Tick do
 
       config :oban_codex, :tick_admission, MyApp.TickAdmission
 
-      def admit(:codex, agent_id, expected_config_revision, run) do
-        MyApp.with_current_agent_config(agent_id, expected_config_revision, run)
+      def admit(:codex, agent_id, expected_delivery_revision, run) do
+        MyApp.with_current_agent_config(agent_id, expected_delivery_revision, run)
       end
 
-  The callback receives the provider, agent id, the optional
-  `"start"["config_revision"]`, and a zero-arity function. That function
+  The callback receives the provider, agent id, the optional top-level
+  `"delivery_revision"`, and a zero-arity function. Jobs without that field
+  fall back to `"start"["config_revision"]` for compatibility. The function
   contains the complete status check, optional Agent start, and prompt
   delivery. The callback's return value becomes the worker result. With no
   callback configured, Tick invokes the function directly.
@@ -103,7 +104,7 @@ defmodule ObanCodex.Agent.Tick do
         [origin: :tick, session: %{"resume" => :resume, "fresh" => :fresh}[session]]
         |> maybe_add_arc(arc_id)
 
-      admit(agent_id, expected_config_revision(args), fn ->
+      admit(agent_id, expected_delivery_revision(args), fn ->
         tick(agent_id, prompt, opts, if_busy, if_offline, args)
       end)
     end
@@ -116,10 +117,14 @@ defmodule ObanCodex.Agent.Tick do
     end
   end
 
-  defp expected_config_revision(%{"start" => %{} = start}),
+  defp expected_delivery_revision(%{"delivery_revision" => revision})
+       when is_binary(revision) and revision != "",
+       do: revision
+
+  defp expected_delivery_revision(%{"start" => %{} = start}),
     do: Map.get(start, "config_revision")
 
-  defp expected_config_revision(_args), do: nil
+  defp expected_delivery_revision(_args), do: nil
 
   defp tick(agent_id, prompt, opts, if_busy, if_offline, args) do
     case Agent.status(agent_id) do
