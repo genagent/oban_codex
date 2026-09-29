@@ -231,6 +231,25 @@ Tick policies are `if_busy` (`"skip"` by default or `"queue"`), `if_offline`
 `queues: [agents: 2, ticks: 1]`; a tick on the Agent turn queue can wait behind
 the work whose busy state it is meant to observe.
 
+A host that owns Agent configuration can atomically admit a tick against the
+revision it expected when building the schedule:
+
+```elixir
+config :oban_codex, :tick_admission, MyApp.TickAdmission
+
+defmodule MyApp.TickAdmission do
+  def admit(:codex, agent_id, expected_config_revision, run) do
+    MyApp.with_current_agent_config(agent_id, expected_config_revision, run)
+  end
+end
+```
+
+`expected_config_revision` is the optional value from the tick's
+`"start"["config_revision"]`. The zero-arity `run` function contains the
+status check, optional Agent start, and prompt delivery. The callback returns
+the Tick worker result and decides whether to invoke `run`. Without
+`:tick_admission`, Tick runs directly with its existing behavior.
+
 ## Safe-boundary pause
 
 A host rail may trip while a turn is still producing the permission request or

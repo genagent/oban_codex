@@ -59,6 +59,23 @@ defmodule ObanCodex.Agent.Tick do
   A `:paused` agent never receives a tick (`{:cancel, :agent_paused}`) --
   lockdown outranks the schedule, in both `"if_busy"` modes.
 
+  ## Admission
+
+  A host that owns Agent configuration may set `:tick_admission` to a module
+  with `admit/4`:
+
+      config :oban_codex, :tick_admission, MyApp.TickAdmission
+
+      def admit(:codex, agent_id, expected_config_revision, run) do
+        MyApp.with_current_agent_config(agent_id, expected_config_revision, run)
+      end
+
+  The callback receives the provider, agent id, the optional
+  `"start"["config_revision"]`, and a zero-arity function. That function
+  contains the complete status check, optional Agent start, and prompt
+  delivery. The callback's return value becomes the worker result. With no
+  callback configured, Tick invokes the function directly.
+
   `max_attempts: 1`: a tick is a point-in-time beat; retrying a failed one
   later would deliver a stale prompt (and risk a duplicate), so a missed beat
   is simply missed. The cancels are visible per-beat in the `oban_jobs` table.
@@ -86,9 +103,23 @@ defmodule ObanCodex.Agent.Tick do
         [origin: :tick, session: %{"resume" => :resume, "fresh" => :fresh}[session]]
         |> maybe_add_arc(arc_id)
 
-      tick(agent_id, prompt, opts, if_busy, if_offline, args)
+      admit(agent_id, expected_config_revision(args), fn ->
+        tick(agent_id, prompt, opts, if_busy, if_offline, args)
+      end)
     end
   end
+
+  defp admit(agent_id, expected_config_revision, run) do
+    case Application.get_env(:oban_codex, :tick_admission) do
+      nil -> run.()
+      module -> module.admit(:codex, agent_id, expected_config_revision, run)
+    end
+  end
+
+  defp expected_config_revision(%{"start" => %{} = start}),
+    do: Map.get(start, "config_revision")
+
+  defp expected_config_revision(_args), do: nil
 
   defp tick(agent_id, prompt, opts, if_busy, if_offline, args) do
     case Agent.status(agent_id) do
