@@ -22,7 +22,7 @@ an Igniter installer, and an opt-in long-lived Agent lifecycle.
 def deps do
   [
     {:oban, "~> 2.23"},
-    {:oban_codex, "~> 0.6.1"}
+    {:oban_codex, "~> 0.6.2"}
   ]
 end
 ```
