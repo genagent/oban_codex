@@ -11,15 +11,15 @@ intentional differences in the README parity table and `SPEC.md`.
 
 ## Public surface
 
-- `ObanCodex.run/2` — string-keyed args to `{oban_return, payload}`.
-- `ObanCodex.Query` — fresh/resumed Codex command adapter; always JSONL.
-- `ObanCodex.Worker` — defaults, pinned args, classifier, result/error hooks.
-- `ObanCodex.Args` — validated job and worker-default builders.
-- `ObanCodex.Outcome` / `ObanCodex.Error` — default classification.
-- `ObanCodex.Testing` — production-shaped JSONL fixtures.
-- `ObanCodex.CLI` and `mix oban_codex` — run, doctor, args.
-- `mix oban_codex.install` — Igniter SQLite/Lite scaffold.
-- `ObanCodex.Agent.*` — opt-in experimental conversational lifecycle.
+- `ObanCodex.run/2`: string-keyed args to `{oban_return, payload}`.
+- `ObanCodex.Query`: fresh/resumed Codex command adapter; always JSONL.
+- `ObanCodex.Worker`: defaults, pinned args, classifier, result/error hooks.
+- `ObanCodex.Args`: validated job and worker-default builders.
+- `ObanCodex.Outcome` / `ObanCodex.Error`: default classification.
+- `ObanCodex.Testing`: production-shaped JSONL fixtures.
+- `ObanCodex.CLI` and `mix oban_codex`: run, doctor, args.
+- `mix oban_codex.install`: Igniter SQLite/Lite scaffold.
+- `ObanCodex.Agent.*`: opt-in experimental conversational lifecycle.
 
 ## Provider rules
 
