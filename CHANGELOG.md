@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.6.1](https://github.com/genagent/oban_codex/compare/v0.6.0...v0.6.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* make approval action IDs restart-safe ([#42](https://github.com/genagent/oban_codex/issues/42)) ([3a921f5](https://github.com/genagent/oban_codex/commit/3a921f56f59135099e62af6c504570c731dc6c9d))
+
 ## [0.6.0](https://github.com/genagent/oban_codex/compare/v0.5.1...v0.6.0) (2026-09-29)
 
 
