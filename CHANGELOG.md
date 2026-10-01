@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.6.2](https://github.com/genagent/oban_codex/compare/v0.6.1...v0.6.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* account for Oban 2.24 snooze semantics ([#44](https://github.com/genagent/oban_codex/issues/44)) ([d7138ba](https://github.com/genagent/oban_codex/commit/d7138ba3c64dc4426be9cdf8d3201fac62937265))
+
 ## [0.6.1](https://github.com/genagent/oban_codex/compare/v0.6.0...v0.6.1) (2026-10-01)
 
 
