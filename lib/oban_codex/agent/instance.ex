@@ -78,7 +78,7 @@ defmodule ObanCodex.Agent.Instance do
   @behaviour :gen_statem
 
   alias CodexWrapper.Result
-  alias ObanCodex.Agent.SessionArcs
+  alias ObanCodex.Agent.{ActionId, SessionArcs}
 
   require Logger
 
@@ -623,7 +623,7 @@ defmodule ObanCodex.Agent.Instance do
         {:next_state, :waiting_for_user, continue_deferred_pause(data)}
 
       {:request_permission, description} ->
-        action = %{id: action_id(), description: description}
+        action = %{id: action_id(data), description: description}
         data = %{data | pending_action: action, gate_turn: data.last_continuation}
         {:next_state, :awaiting_permission, continue_deferred_pause(data)}
 
@@ -647,7 +647,7 @@ defmodule ObanCodex.Agent.Instance do
   end
 
   defp regate_or_idle(%{in_flight_approval: %{description: description}} = data, reason) do
-    action = %{id: action_id(), description: description}
+    action = %{id: action_id(data), description: description}
     data = record(data, {:approval_incomplete, reason})
 
     data =
@@ -1295,7 +1295,8 @@ defmodule ObanCodex.Agent.Instance do
   defp maybe_put_meta(meta, _key, nil), do: meta
   defp maybe_put_meta(meta, key, value), do: Map.put(meta, key, value)
 
-  defp action_id, do: "act_" <> Integer.to_string(System.unique_integer([:positive]))
+  defp action_id(data),
+    do: ActionId.new(data.generation, System.unique_integer([:positive]))
 
   defp record(data, entry) do
     %{data | history: Enum.take([entry | data.history], data.config.max_history)}
