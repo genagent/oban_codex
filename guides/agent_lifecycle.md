@@ -115,6 +115,8 @@ The lifecycle interprets two conventional structured directives:
 - `ask_user` parks in `waiting_for_user`; the next operator prompt is the answer.
 - `request_permission` parks in `awaiting_permission`; approve or reject using
   the action id returned by `status/1`.
+  Treat that id as an opaque string. It includes a random agent generation so
+  a new process cannot reuse a prior process's action id after a restart.
 - anything else returns to `idle`.
 
 ```elixir

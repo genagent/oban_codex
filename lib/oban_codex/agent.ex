@@ -240,6 +240,10 @@ defmodule ObanCodex.Agent do
   @doc """
   Approve the pending action by id (read it off `status/1` or `await/3`).
 
+  Treat action IDs as opaque strings. They include a process generation so an
+  action left in durable downstream state cannot be confused with a new
+  action after the BEAM or agent process restarts.
+
   The continuation turn resumes the Codex session with the approved action as
   its prompt, and carries the agent's `:approved_args` (e.g. a
   `sandbox` elevation) merged over the default args -- so approval
