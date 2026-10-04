@@ -63,15 +63,17 @@ object or array is returned; malformed JSON and scalars return `nil`.
 The thread identifier is `thread_id`, with `session_id` accepted as a defensive
 event fallback.
 
-## Resume compatibility shim
+## Resume and execution observations
 
-Codex CLI supports `codex exec resume --output-schema`, but
-`codex_wrapper 0.4`'s `ExecResume` builder doesn't expose that flag.
-`ObanCodex.Query.Resume` delegates every other option to `ExecResume.args/1`
-and inserts `--output-schema` before the positional thread id and prompt.
+The minimum wrapper version is `codex_wrapper 0.6.0`. Resume uses its public
+`ExecResume` setters for output schema, session id and prompt; no local
+command shim remains. Approval/search config overrides and sandbox behavior
+stay in the existing adapter and wrapper builders.
 
-Remove the shim after the minimum wrapper version exposes this option, with a
-regression test proving identical arguments.
+Fresh, resumed and forked Agent attempts mirror ObanClaude's execution-owned
+session observer contract. See the lifecycle guide for accepted execution,
+observation and completion telemetry. Early observations require a supported
+runner; the default Port runner keeps legacy one-shot execution.
 
 ## Forks
 
@@ -163,7 +165,6 @@ map.
 
 ## Backlog
 
-- Remove the resume output-schema shim after a wrapper release exposes it.
 - Add wrapper-backed typed CLI failure events if Codex gains a stable machine
   error envelope; then refine `Outcome` without parsing prose.
 - Consider a pluggable cost calculator from token usage and model pricing. Do

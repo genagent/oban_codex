@@ -6,8 +6,8 @@ defmodule ObanCodex.Query do
   that want the same JSONL command adapter without outcome classification.
   """
 
-  alias CodexWrapper.{Command, Config, Exec, ExecFork, ExecResume}
-  alias ObanCodex.{Error, Query.Resume}
+  alias CodexWrapper.{Config, Exec, ExecFork, ExecResume}
+  alias ObanCodex.Error
 
   @config_keys [:binary, :working_dir, :timeout, :verbose]
 
@@ -25,6 +25,7 @@ defmodule ObanCodex.Query do
   @spec run(String.t(), keyword()) ::
           {:ok, CodexWrapper.Result.t()} | {:error, ObanCodex.Error.t()}
   def run(prompt, opts) when is_binary(prompt) and is_list(opts) do
+    {execution_opts, opts} = Keyword.split(opts, [:session_observer])
     {config_opts, command_opts} = Keyword.split(opts, @config_keys)
     config = Config.new(config_opts)
 
@@ -36,48 +37,40 @@ defmodule ObanCodex.Query do
           raise ArgumentError, ":fork_session requires :session_id"
 
         {{nil, exec_opts}, _fork?} ->
-          execute(prompt, exec_opts, config)
+          execute(prompt, exec_opts, config, execution_opts)
 
         {{session_id, fork_opts}, true} ->
-          fork(session_id, prompt, fork_opts, config)
+          fork(session_id, prompt, fork_opts, config, execution_opts)
 
         {{session_id, resume_opts}, _fork?} ->
-          resume(session_id, prompt, resume_opts, config)
+          resume(session_id, prompt, resume_opts, config, execution_opts)
       end
 
     normalize_error(outcome)
   end
 
-  defp execute(prompt, opts, config) do
+  defp execute(prompt, opts, config, execution_opts) do
     opts
     |> Enum.reduce(Exec.new(prompt), &apply_exec_option/2)
     |> Exec.json()
-    |> Exec.execute(config)
+    |> Exec.execute(config, execution_opts)
   end
 
-  defp resume(session_id, prompt, opts, config) do
-    {output_schema, opts} = Keyword.pop(opts, :output_schema)
+  defp resume(session_id, prompt, opts, config, execution_opts) do
     {approval_policy, opts} = Keyword.pop(opts, :approval_policy)
     {search, opts} = Keyword.pop(opts, :search)
 
-    resume =
-      opts
-      |> Enum.reduce(ExecResume.new(), &apply_resume_option/2)
-      |> maybe_resume_approval(approval_policy)
-      |> maybe_resume_search(search)
-      |> ExecResume.json()
-
-    command = %Resume{
-      exec: resume,
-      session_id: session_id,
-      prompt: prompt,
-      output_schema: output_schema
-    }
-
-    Command.run(Resume, command, config)
+    opts
+    |> Enum.reduce(ExecResume.new(), &apply_resume_option/2)
+    |> maybe_resume_approval(approval_policy)
+    |> maybe_resume_search(search)
+    |> ExecResume.json()
+    |> ExecResume.session_id(session_id)
+    |> ExecResume.prompt(prompt)
+    |> ExecResume.execute(config, execution_opts)
   end
 
-  defp fork(session_id, prompt, opts, config) do
+  defp fork(session_id, prompt, opts, config, execution_opts) do
     {approval_policy, opts} = Keyword.pop(opts, :approval_policy)
     {search, opts} = Keyword.pop(opts, :search)
 
@@ -87,7 +80,7 @@ defmodule ObanCodex.Query do
     |> then(&Enum.reduce(opts, &1, fn option, fork -> apply_fork_option(option, fork) end))
     |> maybe_config(&ExecFork.config/2, approval_config(approval_policy))
     |> maybe_config(&ExecFork.config/2, search_config(search))
-    |> ExecFork.fork(config)
+    |> ExecFork.fork(config, execution_opts)
     |> case do
       {:ok, %{result: result}} -> {:ok, result}
       # Keep a non-zero exit a result, matching fresh and resumed turns.
@@ -147,6 +140,9 @@ defmodule ObanCodex.Query do
   defp apply_exec_option({:local_provider, value}, exec), do: Exec.local_provider(exec, value)
   defp apply_exec_option({_key, nil}, exec), do: exec
   defp apply_exec_option({_key, false}, exec), do: exec
+
+  defp apply_resume_option({:output_schema, value}, resume),
+    do: ExecResume.output_schema(resume, value)
 
   defp apply_resume_option({:model, value}, resume), do: ExecResume.model(resume, value)
   defp apply_resume_option({:sandbox, value}, resume), do: ExecResume.sandbox(resume, value)

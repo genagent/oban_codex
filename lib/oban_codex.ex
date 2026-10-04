@@ -105,7 +105,13 @@ defmodule ObanCodex do
     classifier = Keyword.get(opts, :classifier, &ObanCodex.Outcome.classify/1)
     query_fun = Keyword.get(opts, :query_fun, &ObanCodex.Query.run/2)
     job = Keyword.get(opts, :job)
+    observer = ObanCodex.Agent.Job.session_observer(job)
     {prompt, query_opts} = build(args)
+
+    query_opts =
+      if observer && not Keyword.has_key?(opts, :query_fun) && observed_runner?(),
+        do: Keyword.put(query_opts, :session_observer, observer),
+        else: query_opts
 
     start = System.monotonic_time()
     emit_start(args, job)
@@ -115,6 +121,11 @@ defmodule ObanCodex do
     outcome
     |> classifier.()
     |> validate_classified!(classifier)
+  end
+
+  defp observed_runner? do
+    runner = CodexWrapper.Runner.impl()
+    Code.ensure_loaded?(runner) and function_exported?(runner, :run_observed, 5)
   end
 
   @doc "Parse the Codex JSONL stdout into event structs."
