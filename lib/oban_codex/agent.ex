@@ -71,6 +71,8 @@ defmodule ObanCodex.Agent do
           | :stale_turn
           | {:invalid_state, atom()}
 
+  alias ObanCodex.Agent.Execution
+
   @doc """
   Spawn a new agent under the dynamic supervisor.
 
@@ -346,6 +348,26 @@ defmodule ObanCodex.Agent do
   def history(agent_id), do: call(agent_id, :history)
 
   @doc """
+  Register one executing job attempt and return its local session observer.
+
+  The owning Agent validates the persisted job id, generation, logical turn,
+  arc, attempt and snooze counter. The returned PID/reference stays local to
+  this execution and must never be persisted in job args or metadata.
+  """
+  @spec job_started(agent_id(), Oban.Job.t()) ::
+          {:ok, {pid(), reference()}} | {:error, term()}
+  def job_started(agent_id, %Oban.Job{} = job) do
+    meta = Execution.job_meta(job)
+
+    with_identity(agent_id, meta, fn ->
+      with_agent(agent_id, &:gen_statem.call(&1, {:job_started, meta}))
+    end)
+  catch
+    :exit, {reason, {:gen_statem, :call, _args}} when reason in [:noproc, :normal, :shutdown] ->
+      {:error, :agent_not_running}
+  end
+
+  @doc """
   The return path for workers: report a finished turn back to its agent.
 
   `ObanCodex.Agent.Job` calls this from `handle_result/2` /
@@ -361,7 +383,13 @@ defmodule ObanCodex.Agent do
         ) :: :ok | {:error, :agent_not_running | :turn_identity_required}
   def job_finished(agent_id, payload, captured_meta) do
     with_identity(agent_id, captured_meta, fn ->
-      with_agent(agent_id, &:gen_statem.cast(&1, {:job_finished, payload, captured_meta}))
+      with_agent(
+        agent_id,
+        &:gen_statem.cast(
+          &1,
+          {:job_finished, payload, Map.put(captured_meta, :callback_pid, self())}
+        )
+      )
     end)
   end
 
@@ -384,7 +412,13 @@ defmodule ObanCodex.Agent do
           :ok | {:error, :agent_not_running | :turn_identity_required}
   def job_retrying(agent_id, retry, captured_meta) do
     with_identity(agent_id, captured_meta, fn ->
-      with_agent(agent_id, &:gen_statem.cast(&1, {:job_retrying, retry, captured_meta}))
+      with_agent(
+        agent_id,
+        &:gen_statem.cast(
+          &1,
+          {:job_retrying, retry, Map.put(captured_meta, :callback_pid, self())}
+        )
+      )
     end)
   end
 

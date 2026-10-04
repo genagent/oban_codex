@@ -32,7 +32,7 @@ Requirements:
 
 - Elixir `~> 1.20`
 - a configured Oban instance
-- `codex_wrapper ~> 0.5`
+- `codex_wrapper ~> 0.6.0`
 - the `codex` CLI installed and authenticated for real runs
 
 Check a worker node before enabling its queue:
