@@ -8,6 +8,13 @@
 
 All notable changes to this project will be documented here.
 
+## [0.7.1](https://github.com/genagent/oban_codex/compare/v0.7.0...v0.7.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* **agent:** admit exact resume handle after cache eviction ([#50](https://github.com/genagent/oban_codex/issues/50)) ([c05d795](https://github.com/genagent/oban_codex/commit/c05d7953c662803c0e804f10c231cc5d8f12dfba))
+
 ## [0.7.0](https://github.com/genagent/oban_codex/compare/v0.6.2...v0.7.0) (2026-10-04)
 
 
