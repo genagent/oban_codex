@@ -172,6 +172,22 @@ delivery, job metadata, turn transitions, approval continuations, and
 completion. Turn events also expose the wrapper-owned `agent_generation` and
 `agent_turn_id`. Least-recently used inactive handles are evicted at the
 configured bound. Durable persistence and rotation policy belong to the host.
+If the host still has a compatible exact handle after eviction, it can supply
+it with the turn so admission and enqueue happen in one state-machine event:
+
+```elixir
+ObanCodex.Agent.submit_prompt("triage-7", "operator work",
+  arc_id: "operator",
+  resume_session_id: persisted_operator_thread_id
+)
+```
+
+The handle is used only when that arc is absent from the live cache. A
+different live handle returns `{:error, {:session_conflict, arc_id}}` without
+enqueuing; the host must reconcile its durable record. This does not verify
+that an evicted provider transcript still exists. A confirmed native rejection
+still requires the host's explicit recovery policy. Keep gate-bound answers on
+the arc that opened the gate.
 
 `fork_arc/5` forks the source arc's Codex thread into the target arc through
 `codex exec fork` and runs the prompt on the fork. If the target arc already
